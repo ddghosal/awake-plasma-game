@@ -1,0 +1,1637 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import React from "react";
+
+const C = {
+  bg:"#040c18", panel:"#071424", border:"#122840",
+  accent:"#00c8f0", accentDim:"#00c8f018", glow:"#00c8f044",
+  proton:"#f59e0b", protonDim:"#f59e0b18",
+  electron:"#a78bfa", electronDim:"#a78bfa18",
+  plasma:"#00ff88", plasmaDim:"#00ff8818",
+  danger:"#ff3b5c", warn:"#fbbf24",
+  text:"#c0ddf0", dim:"#3a5a7a", dimmer:"#122030",
+  osr:"#ff9f1c", medical:"#f472b6",
+};
+
+const COMPONENT_DEFS = [
+  { id:"sps",    label:"SPS Proton Driver",      short:"SPS",    color:C.proton,   desc:"400 GeV/c proton bunch from SPS — arrives at angle, merged onto AWAKE axis" },
+  { id:"tdx",    label:"Transfer Dipole (TD)",  short:"TD",    color:"#38bdf8",  desc:"Bending magnet that steers SPS proton beam onto the AWAKE beamline axis" },
+  { id:"plasma", label:"Rb Plasma + e⁻ Inject.", short:"PLASMA", color:C.plasma,   desc:"10m Rb plasma cell; e⁻ witness bunch injected INTO the column from side" },
+  { id:"einj",   label:"e⁻ Injection Line",      short:"e⁻INJ",  color:C.electron, desc:"Electron gun + transfer line injecting witness bunch into the plasma" },
+  { id:"otr1",   label:"OTR Screen",             short:"OTR",    color:"#f472b6",  desc:"Downstream diagnostic — measures e⁻ beam size after plasma exit" },
+  { id:"qf_e",   label:"Electron Quads",         short:"QF-e",   color:"#7dd3fc",  desc:"Quadrupoles re-focus the accelerated electron beam before the dipole" },
+  { id:"dip_e",  label:"Dipole (SR bend)",        short:"DIP",    color:C.osr,      desc:"Bends e⁻ beam; SR emitted tangentially → OSR screen" },
+  { id:"dump",   label:"Beam Dump",              short:"DUMP",   color:"#dc2626",  desc:"Absorbs spent proton and electron beams — end of AWAKE line" },
+];
+const CORRECT_ORDER = ["sps","tdx","plasma","einj","otr1","qf_e","dip_e","dump"];
+
+const mm=(A,B)=>[[A[0][0]*B[0][0]+A[0][1]*B[1][0],A[0][0]*B[0][1]+A[0][1]*B[1][1]],[A[1][0]*B[0][0]+A[1][1]*B[1][0],A[1][0]*B[0][1]+A[1][1]*B[1][1]]];
+const drift=L=>[[1,L],[0,1]];
+const quad=f=>[[1,0],[-1/f,1]];
+const dip=()=>[[1,0.4],[0,1]];
+const ELEM_M = {
+  sps:drift(0.6), tdx:mm(drift(0.2),mm(dip(),drift(0.2))),
+  plasma:drift(2.5), einj:drift(0.15), otr1:drift(0.2),
+  qf_e:mm(drift(0.15),mm(quad(1.8),drift(0.15))),
+  dip_e:mm(drift(0.2),mm(dip(),drift(0.2))), dump:drift(0.1),
+};
+function computeEnvelope(ids){
+  let b=5.0,a=0.0,g=(1+a*a)/b;
+  const pts=[{s:0,sigma:Math.sqrt(b)*7}]; let s=0;
+  for(const id of ids){
+    const M=ELEM_M[id]||drift(0.5);
+    const nb=M[0][0]*M[0][0]*b-2*M[0][0]*M[0][1]*a+M[0][1]*M[0][1]*g;
+    const na=-M[1][0]*M[0][0]*b+(M[0][0]*M[1][1]+M[0][1]*M[1][0])*a-M[0][1]*M[1][1]*g;
+    b=Math.max(0.01,nb);a=na;g=(1+a*a)/b;s++;
+    pts.push({s,sigma:Math.min(70,Math.max(2,Math.sqrt(b)*7))});
+  }
+  return pts;
+}
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+
+class ErrorBoundary extends React.Component {
+  constructor(props){super(props);this.state={crashed:false,err:""};}
+  static getDerivedStateFromError(e){return{crashed:true,err:e?.message||"unknown"};}
+  componentDidCatch(e,info){console.error("AWAKE crash:",e,info);}
+  render(){
+    if(this.state.crashed)return(
+      <div style={{padding:24,background:"#040c18",borderRadius:10,border:`2px solid ${C.danger}`,fontFamily:"monospace",color:C.danger,textAlign:"center"}}>
+        <div style={{fontSize:22,marginBottom:8}}>⚠ Render error</div>
+        <div style={{fontSize:11,color:C.text,marginBottom:14}}>{this.state.err}</div>
+        <button onClick={()=>this.setState({crashed:false,err:""})}
+          style={{padding:"8px 20px",borderRadius:6,border:`1px solid ${C.accent}`,background:"transparent",color:C.accent,cursor:"pointer",fontFamily:"monospace"}}>
+          ↺ Retry
+        </button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+function Stat({label,value,color}){
+  return(<div><div style={{color:C.dim,fontSize:9,fontFamily:"monospace",marginBottom:2}}>{label}</div><div style={{color,fontSize:14,fontWeight:"bold",fontFamily:"monospace"}}>{value}</div></div>);
+}
+function ScoreBadge({label,score}){
+  const pct=score/100;
+  const col=pct>0.7?C.plasma:pct>0.4?C.warn:pct>0?C.danger:C.dim;
+  return(
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",background:"#040c18",border:`1px solid ${C.border}`,borderRadius:8,padding:"6px 12px",minWidth:66}}>
+      <div style={{color:C.dim,fontSize:8,fontFamily:"monospace",marginBottom:2,letterSpacing:1}}>{label}</div>
+      <div style={{color:col,fontSize:16,fontWeight:"bold",fontFamily:"monospace"}}>{score||"—"}</div>
+      <div style={{width:40,height:3,background:C.dimmer,borderRadius:2,marginTop:2}}>
+        <div style={{width:`${pct*100}%`,height:"100%",background:col,borderRadius:2,transition:"width 0.5s"}}/>
+      </div>
+    </div>
+  );
+}
+function BackBtn({onClick}){
+  return(<button onClick={onClick} style={{padding:"6px 14px",borderRadius:5,border:`1px solid ${C.dim}`,background:"transparent",color:C.dim,fontFamily:"monospace",fontSize:11,cursor:"pointer"}}>← Back</button>);
+}
+
+function OpticsCanvas({placedIds}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const cv=ref.current;if(!cv)return;
+    const ctx=cv.getContext("2d");
+    const W=cv.width=cv.offsetWidth||600,H=cv.height=76;
+    ctx.fillStyle="#030a12";ctx.fillRect(0,0,W,H);
+    const pts=computeEnvelope(placedIds);
+    if(pts.length<2)return;
+    const mx=Math.max(...pts.map(p=>p.sigma),1);
+    const yM=H/2;
+    const ptX=(i)=>{const t=N_SLOTS*(78+4)-4;const sc=W/t;return i===0?sc*39:Math.min(W-4,(i-0.5)*(78+4)*sc+39*sc);};
+    const N_SLOTS=CORRECT_ORDER.length;
+    const slotW=(78+4);const scale=W/(N_SLOTS*slotW-4);
+    const cx2=(i)=>i===0?scale*39:(i*(slotW)*scale-slotW*scale/2);
+    ctx.beginPath();
+    pts.forEach((p,i)=>{const x=Math.min(W,(i/pts.length)*W+(1/pts.length/2)*W),y=yM-(p.sigma/mx)*(H*0.42);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
+    pts.slice().reverse().forEach((p,i)=>{const ii=pts.length-1-i;const x=Math.min(W,(ii/pts.length)*W+(1/pts.length/2)*W),y=yM+(p.sigma/mx)*(H*0.42);ctx.lineTo(x,y);});
+    ctx.closePath();
+    const g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,`${C.accent}44`);g.addColorStop(1,`${C.accent}08`);
+    ctx.fillStyle=g;ctx.fill();
+    ["top","bot"].forEach(s=>{
+      ctx.beginPath();
+      pts.forEach((p,i)=>{const x=Math.min(W,(i/pts.length)*W+(1/pts.length/2)*W),y=yM+(s==="top"?-1:1)*(p.sigma/mx)*(H*0.42);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
+      ctx.strokeStyle=C.accent;ctx.lineWidth=1.5;ctx.stroke();
+    });
+    ctx.font="7px monospace";ctx.fillStyle=C.dim;ctx.textAlign="left";ctx.fillText("σ(s) Envelope",4,10);
+  },[placedIds]);
+  return <canvas ref={ref} style={{width:"100%",height:76,display:"block",borderRadius:6,border:`1px solid ${C.dimmer}`}}/>;
+}
+
+// ── BEAMLINE BUILDER (canvas-based, crash-free) ──
+const BUILDER_H=210;
+const SLOT_DEFS=[
+  {id:"sps",   x:0.02,y:0.55,w:0.09,h:0.30,label:"SPS\np⁺",        color:C.proton},
+  {id:"tdx",   x:0.14,y:0.55,w:0.07,h:0.30,label:"Dipole\n(p)",     color:"#38bdf8"},
+  {id:"plasma",x:0.24,y:0.46,w:0.20,h:0.38,label:"Plasma\nColumn",  color:C.plasma},
+  {id:"otr1",  x:0.47,y:0.55,w:0.07,h:0.30,label:"OTR\nImaging",    color:"#f472b6"},
+  {id:"qf_e",  x:0.57,y:0.55,w:0.07,h:0.30,label:"QF",              color:"#7dd3fc"},
+  {id:"dip_e", x:0.67,y:0.55,w:0.07,h:0.30,label:"BP/\nDipole",     color:C.osr},
+  {id:"dump",  x:0.82,y:0.55,w:0.08,h:0.30,label:"Beam Dump",            color:"#dc2626"},
+  {id:"einj",  x:0.24,y:0.05,w:0.13,h:0.26,label:"RF Gun/\ne⁻ INJ", color:C.electron},
+];
+
+function BeamlineBuilder({onComplete,onBack}){
+  const cvRef=useRef(null);
+  const [slotMap,setSlotMap]=useState({});
+  const [bank,setBank]=useState([...COMPONENT_DEFS].sort(()=>Math.random()-0.5));
+  const [dragging,setDragging]=useState(null);
+  const [mouseXY,setMouseXY]=useState({x:0,y:0});
+  const [hover,setHover]=useState(null);
+  const [fired,setFired]=useState(false);
+  const [msg,setMsg]=useState(null);
+
+  const slotPx=useCallback((s,W,H)=>({x:s.x*W,y:s.y*H,w:s.w*W,h:s.h*H}),[]);
+  const getSlotAt=useCallback((px,py,W,H)=>{
+    for(const s of SLOT_DEFS){const{x,y,w,h}=slotPx(s,W,H);if(px>=x&&px<x+w&&py>=y&&py<y+h)return s.id;}
+    return null;
+  },[slotPx]);
+
+  useEffect(()=>{
+    const cv=cvRef.current;if(!cv)return;
+    const W=cv.width=cv.offsetWidth||700;const H=cv.height=BUILDER_H;
+    const ctx=cv.getContext("2d");
+    ctx.fillStyle="#040c18";ctx.fillRect(0,0,W,H);
+    const beam_y=0.705*H;
+    ctx.strokeStyle=C.dimmer;ctx.lineWidth=1;ctx.setLineDash([3,5]);
+    ctx.beginPath();ctx.moveTo(0.02*W,beam_y);ctx.lineTo(0.91*W,beam_y);ctx.stroke();
+    ctx.setLineDash([]);
+    // SPS angled line
+    ctx.strokeStyle=C.proton+"44";ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo((0.02+0.09)*W,(0.55+0.15)*H);ctx.lineTo(0.14*W,(0.55+0.15)*H);ctx.stroke();
+    // e⁻INJ dashed line to plasma
+    ctx.strokeStyle=C.electron+"66";ctx.setLineDash([4,3]);ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo((0.24+0.065)*W,(0.05+0.26)*H);ctx.lineTo((0.24+0.06)*W,0.46*H);ctx.stroke();
+    ctx.setLineDash([]);
+    // SR fan lines — emanate from dipole top-left at 65° upward
+    const dipMx=(0.67+0.035)*W, dipTy=0.55*H;
+    const SR_ANG_B = -Math.PI*65/180;   // 65° upward-right
+    const fanLen = H*0.52;               // natural ray length, no box target
+    const nRays = 12;
+    for(let r=0;r<nRays;r++){
+      const t=r/(nRays-1), ang=SR_ANG_B+(t-0.5)*0.38;
+      const inten=Math.exp(-0.5*Math.pow((t-0.5)/0.22,2));
+      ctx.beginPath();ctx.moveTo(dipMx,dipTy);
+      ctx.lineTo(dipMx+Math.cos(ang)*fanLen*inten, dipTy+Math.sin(ang)*fanLen*inten);
+      ctx.strokeStyle=`rgba(255,159,28,${inten*0.62})`;ctx.lineWidth=1.4;ctx.stroke();
+    }
+    // "SR shower" label — placed at the mid-cone tip, no box
+    const labelDist = fanLen*0.62;
+    const labelX = dipMx + Math.cos(SR_ANG_B)*labelDist;
+    const labelY = dipTy + Math.sin(SR_ANG_B)*labelDist - 6;
+    ctx.save();
+    ctx.font="italic bold 8px monospace";
+    ctx.fillStyle="rgba(255,159,28,0.82)";
+    ctx.textAlign="center";
+    ctx.fillText("SR shower",labelX,labelY);
+    // Soft "OSR Diagnostics" note — dim, no box, just a hint near cone tip area
+    ctx.font="8px monospace";
+    ctx.fillStyle="#f472b6aa";
+    ctx.fillText("OSR Diagnostics →",labelX+18,labelY-12);
+    ctx.restore();
+    // Slots
+    SLOT_DEFS.forEach(s=>{
+      const{x,y,w,h}=slotPx(s,W,H);const comp=slotMap[s.id];const correct=comp&&comp.id===s.id;
+      ctx.fillStyle=comp?`${comp.color}18`:"#040c18";ctx.fillRect(x,y,w,h);
+      ctx.strokeStyle=comp?(correct?C.plasma:C.danger):C.dimmer;
+      ctx.lineWidth=comp?2:1;ctx.setLineDash(comp?[]:[3,4]);ctx.strokeRect(x,y,w,h);ctx.setLineDash([]);
+      ctx.font="7px monospace";ctx.fillStyle=C.dimmer;ctx.textAlign="left";
+      ctx.fillText(CORRECT_ORDER.indexOf(s.id)+1,x+3,y+10);
+      if(comp){
+        ctx.font=`bold 8px monospace`;ctx.fillStyle=correct?C.plasma:comp.color;ctx.textAlign="center";
+        const lines=comp.short.split(/[-\s/]/);
+        lines.forEach((l,i)=>ctx.fillText(l,x+w/2,y+h/2-4+(lines.length===1?5:0)+i*11));
+        if(correct){ctx.font="10px monospace";ctx.fillStyle=C.plasma;ctx.textAlign="right";ctx.fillText("✓",x+w-3,y+11);}
+      }else{
+        ctx.font="7px monospace";ctx.fillStyle=C.dimmer+"88";ctx.textAlign="center";
+        ctx.fillText(s.label.split("\n")[0],x+w/2,y+h/2+3);
+      }
+    });
+    if(dragging){
+      const{item}=dragging;const gw=64,gh=42;
+      ctx.globalAlpha=0.85;ctx.fillStyle=`${item.color}33`;ctx.fillRect(mouseXY.x-gw/2,mouseXY.y-gh/2,gw,gh);
+      ctx.strokeStyle=item.color;ctx.lineWidth=2;ctx.strokeRect(mouseXY.x-gw/2,mouseXY.y-gh/2,gw,gh);
+      ctx.font="bold 9px monospace";ctx.fillStyle=item.color;ctx.textAlign="center";
+      ctx.fillText(item.short,mouseXY.x,mouseXY.y+4);ctx.globalAlpha=1;
+    }
+    if(fired){ctx.fillStyle="rgba(0,255,136,0.05)";ctx.fillRect(0,0,W,H);}
+  },[slotMap,dragging,mouseXY,fired,slotPx]);
+
+  const getPos=e=>{const r=cvRef.current.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};};
+  const handleMouseDown=e=>{
+    if(fired)return;const{x,y}=getPos(e);const W=cvRef.current.offsetWidth;
+    const sid=getSlotAt(x,y,W,BUILDER_H);
+    if(sid&&slotMap[sid]){const item=slotMap[sid];setSlotMap(m=>{const n={...m};delete n[sid];return n;});setDragging({item});setMouseXY({x,y});}
+  };
+  const handleMouseMove=e=>{if(dragging){const{x,y}=getPos(e);setMouseXY({x,y});}};
+  const handleMouseUp=e=>{
+    if(!dragging)return;const{x,y}=getPos(e);const W=cvRef.current.offsetWidth;
+    const sid=getSlotAt(x,y,W,BUILDER_H);
+    if(sid){const displaced=slotMap[sid];if(displaced)setBank(b=>[...b,displaced]);setSlotMap(m=>({...m,[sid]:dragging.item}));}
+    else setBank(b=>[...b,dragging.item]);
+    setDragging(null);
+  };
+
+  // No setTimeout/useEffect navigation — onComplete called directly by button click
+  const correctCount=CORRECT_ORDER.filter(id=>slotMap[id]&&slotMap[id].id===id).length;
+  const fire=()=>{
+    if(!CORRECT_ORDER.every(id=>slotMap[id]&&slotMap[id].id===id)){
+      setMsg({ok:false,t:`${correctCount}/8 correct — check e⁻INJ (above plasma) and dipole order!`});return;
+    }
+    setFired(true);setMsg({ok:true,t:"✓ Beamline validated! Proton beam firing..."});
+  };
+
+  return(
+    <div>
+      {onBack&&<div style={{marginBottom:8}}><BackBtn onClick={onBack}/></div>}
+      <p style={{color:C.dim,fontSize:11,fontFamily:"monospace",margin:"0 0 4px"}}>
+        Drag components from the bank onto the correct slot. <span style={{color:C.plasma}}>{correctCount}/8 correct</span>
+      </p>
+      <div style={{height:3,background:C.dimmer,borderRadius:2,marginBottom:6}}>
+        <div style={{height:"100%",width:`${(correctCount/8)*100}%`,background:`linear-gradient(90deg,${C.accent},${C.plasma})`,borderRadius:2,transition:"width 0.4s"}}/>
+      </div>
+      <div style={{marginBottom:6}}><OpticsCanvas placedIds={CORRECT_ORDER.filter(id=>slotMap[id]&&slotMap[id].id===id)}/></div>
+      <canvas ref={cvRef} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}
+        onMouseLeave={()=>{if(dragging){setBank(b=>[...b,dragging.item]);setDragging(null);}}}
+        style={{width:"100%",height:BUILDER_H,display:"block",borderRadius:8,border:`1px solid ${C.border}`,cursor:dragging?"grabbing":"crosshair",marginBottom:10}}/>
+      <div style={{padding:"8px 10px",background:"#040c18",borderRadius:7,border:`1px solid ${C.dimmer}`,marginBottom:8}}>
+        <div style={{color:C.dim,fontSize:8,fontFamily:"monospace",marginBottom:5,letterSpacing:1}}>COMPONENT BANK — drag onto canvas above</div>
+        <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+          {bank.map(c=>(
+            <div key={c.id} onMouseDown={e=>{e.stopPropagation();setBank(b=>b.filter(x=>x.id!==c.id));setDragging({item:c});
+              const cv=cvRef.current;if(cv){const r=cv.getBoundingClientRect();setMouseXY({x:e.clientX-r.left,y:e.clientY-r.top});}}}
+              onMouseEnter={()=>setHover(c)} onMouseLeave={()=>setHover(null)}
+              style={{padding:"4px 9px",borderRadius:5,cursor:"grab",fontFamily:"monospace",fontSize:10,fontWeight:"bold",
+                border:`1px solid ${c.color}`,background:`${c.color}15`,color:c.color,userSelect:"none",
+                transform:hover?.id===c.id?"translateY(-2px)":"none",transition:"all 0.15s"}}>
+              {c.short}
+            </div>
+          ))}
+          {bank.length===0&&<span style={{color:C.dim,fontSize:10,fontFamily:"monospace"}}>All placed ↑</span>}
+        </div>
+      </div>
+      {hover&&<div style={{padding:"5px 10px",background:"#040c18",border:`1px solid ${hover.color}`,borderRadius:5,marginBottom:7,fontSize:11}}>
+        <span style={{color:hover.color,fontWeight:"bold"}}>{hover.label}: </span><span style={{color:C.text}}>{hover.desc}</span>
+      </div>}
+      <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+        {!fired&&<button onClick={fire} style={{padding:"9px 24px",borderRadius:7,border:"none",cursor:"pointer",
+          background:C.accent,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:12,
+          boxShadow:`0 0 14px ${C.glow}`}}>
+          ⚡ VALIDATE & FIRE BEAM
+        </button>}
+        {fired&&<button onClick={()=>onComplete(100)} style={{padding:"9px 24px",borderRadius:7,border:"none",cursor:"pointer",
+          background:C.plasma,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:12,
+          boxShadow:`0 0 22px ${C.plasma}99`}}>
+          ✓ BEAM FIRING — CONTINUE TO OVERVIEW →
+        </button>}
+      </div>
+      {msg&&<div style={{marginTop:8,padding:"8px 12px",borderRadius:6,fontFamily:"monospace",fontSize:11,
+        border:`1px solid ${msg.ok?C.plasma:C.danger}`,background:`${msg.ok?C.plasma:C.danger}0e`,color:msg.ok?C.plasma:C.danger}}>{msg.t}</div>}
+    </div>
+  );
+}
+
+// ── JIGSAW QUIZ (crash-proof, pre-computed) ──
+
+// ═══════════════════════════════════════════════════════════════
+// JIGSAW QUIZ — SVG interlocking tiles
+//
+// Each round has 6 tiles (3 correct + 3 wrong).
+// Correct tiles share matching interlocking edges — a tab on one
+// tile mates with a socket on its neighbour, so they physically
+// snap together into a connected chain.
+// Wrong tiles have mismatched profiles and won't connect.
+//
+// Edge profiles are encoded as 4-bit vectors per tile:
+//   [top, right, bottom, left]  1=tab, -1=socket, 0=flat
+// Correct tiles: right edge of tile[i] == -left edge of tile[i+1]
+// Wrong tiles: random independent profiles that don't match.
+//
+// Players can solve it purely by shape even without reading text!
+// ═══════════════════════════════════════════════════════════════
+
+const QUIZ_ROUNDS=[
+  {id:"sps",name:"SPS Proton Driver",color:C.proton,icon:"⚡",
+   desc:"Which 3 components belong together to make the SPS proton beam source?",
+   correct:[{id:"pb",label:"Proton bunch\n6×10¹¹ p",color:C.proton},
+            {id:"gev",label:"400 GeV/c\nmomentum",color:C.proton},
+            {id:"kck",label:"Fast extraction\nkicker magnet",color:C.proton}],
+   wrong:  [{id:"las",label:"Ti:Sa\nlaser pulse",color:C.electron},
+            {id:"rb", label:"Rb vapour\nsource",color:C.plasma},
+            {id:"rfg",label:"RF photo-\ninjector",color:C.electron}]},
+  {id:"plasma",name:"Rb Plasma Column",color:C.plasma,icon:"🌀",
+   desc:"Which 3 sub-systems form the 10 m rubidium plasma cell?",
+   correct:[{id:"rbs",label:"Rb metal\nvapour source",color:C.plasma},
+            {id:"ion",label:"Ionisation\nlaser (Ti:Sa)",color:C.plasma},
+            {id:"hcl",label:"Heated vapour\ncell (200°C)",color:C.plasma}],
+   wrong:  [{id:"sol",label:"Solenoid\ncoil",color:"#7dd3fc"},
+            {id:"prf",label:"RF proton\ncavity",color:C.proton},
+            {id:"cher",label:"Cherenkov\ndetector",color:"#f472b6"}]},
+  {id:"einj",name:"e⁻ Injection Line",color:C.electron,icon:"🔫",
+   desc:"Which 3 elements deliver the electron witness bunch?",
+   correct:[{id:"gun",label:"RF photo-\ninjector gun",color:C.electron},
+            {id:"lin",label:"Electron\nlinac booster",color:C.electron},
+            {id:"fq", label:"Focusing\nquadrupoles",color:"#7dd3fc"}],
+   wrong:  [{id:"und",label:"Undulator\nwiggler",color:C.osr},
+            {id:"pc2",label:"2nd plasma\ncell",color:C.plasma},
+            {id:"mir",label:"SR collection\nmirror",color:"#f472b6"}]},
+  {id:"diag",name:"OTR / OSR Diagnostics",color:"#f472b6",icon:"🔬",
+   desc:"Which 3 items form the downstream diagnostic suite?",
+   correct:[{id:"otr",label:"OTR Al-foil\nscreen",color:"#f472b6"},
+            {id:"ccd",label:"CCD/sCMOS\ncamera",color:"#f472b6"},
+            {id:"srs",label:"SR spectr-\nometer + OSR",color:C.osr}],
+   wrong:  [{id:"rbv",label:"Rb vapour\ncell",color:C.plasma},
+            {id:"tng",label:"Tungsten\nabsorber",color:"#dc2626"},
+            {id:"pmr",label:"Plasma\nmirror",color:C.plasma}]},
+];
+
+function shu(arr){const a=[...arr];for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+
+// Assign interlocking edges per round at module-load time.
+// Correct chain: A─B─C with matching right/left connectors.
+// Wrong tiles: intentionally mismatched profiles.
+// RIGHT edge: dir=-1 = TAB protrudes outward, dir=+1 = SOCKET indents inward (arc direction)
+function makeEdges(){
+  // RIGHT edge dir=-1 = TAB protrudes rightward; dir=+1 = SOCKET indents leftward
+  // LEFT  edge dir=+1 = SOCKET accepts right-tab; dir=-1 = TAB protrudes leftward
+  //
+  // Chain reads L→R as: [TAB-right] [SOCKET-left + TAB-right] [SOCKET-left]
+  //   edgesMatch(a,b): a.right === -b.left
+  //   chain[0]→[1]: (-1) === -(+1) = -1  ✓
+  //   chain[1]→[2]: (-1) === -(+1) = -1  ✓
+  //
+  // Wrong tiles: right=0 AND left=0 → can NEVER satisfy edgesMatch (requires ≠0)
+  // They get top/bottom decorations so they still look like proper jigsaw pieces.
+  const chain=[
+    {top:0,  right:-1, bottom:0,  left:0 },  // A: TAB on right only
+    {top:0,  right:-1, bottom:0,  left:1 },  // B: SOCKET left + TAB right
+    {top:0,  right:0,  bottom:0,  left:1 },  // C: SOCKET on left only
+  ];
+  const wrong=[
+    {top:1,  right:0,  bottom:-1, left:0 },  // decorative only — cannot chain
+    {top:-1, right:0,  bottom:1,  left:0 },  // decorative only — cannot chain
+    {top:1,  right:0,  bottom:1,  left:0 },  // decorative only — cannot chain
+  ];
+  return {chain,wrong};
+}
+const EDGES=makeEdges();
+
+// Pre-shuffle tiles for each round (stable per session)
+const SHUFFLED=QUIZ_ROUNDS.map(r=>{
+  const tilesWithEdges=[
+    {...r.correct[0], edges:EDGES.chain[0], isCorrect:true,  chainIdx:0},
+    {...r.correct[1], edges:EDGES.chain[1], isCorrect:true,  chainIdx:1},
+    {...r.correct[2], edges:EDGES.chain[2], isCorrect:true,  chainIdx:2},
+    {...r.wrong[0],   edges:EDGES.wrong[0], isCorrect:false, chainIdx:-1},
+    {...r.wrong[1],   edges:EDGES.wrong[1], isCorrect:false, chainIdx:-1},
+    {...r.wrong[2],   edges:EDGES.wrong[2], isCorrect:false, chainIdx:-1},
+  ];
+  return {...r, tiles:shu(tilesWithEdges)};
+});
+
+// Draw a jigsaw tile path on an SVG-like canvas context.
+// (x,y) = top-left corner, w/h = dimensions
+// edges = {top,right,bottom,left} each -1/0/1
+// tab protrudes outward, socket indents inward
+function jigsawPath(ctx, x, y, w, h, edges){
+  const r = Math.min(w,h)*0.18; // tab/socket radius
+  const m = Math.min(w,h)*0.08; // margin from corners
+
+  ctx.beginPath();
+
+  // Top edge: left→right
+  ctx.moveTo(x, y);
+  if(edges.top===0){
+    ctx.lineTo(x+w, y);
+  } else {
+    const cx2=x+w/2, dir=edges.top; // top: dir=-1=tab up, dir=+1=socket down (arc inverted)
+    ctx.lineTo(cx2-r, y);
+    ctx.arc(cx2, y+dir*r, r, Math.PI, 0, dir<0);
+    ctx.lineTo(x+w, y);
+  }
+
+  // Right edge: top→bottom
+  if(edges.right===0){
+    ctx.lineTo(x+w, y+h);
+  } else {
+    const cy2=y+h/2, dir=edges.right; // dir: 1=tab right, -1=socket left
+    ctx.lineTo(x+w, cy2-r);
+    ctx.arc(x+w-dir*r, cy2, r, -Math.PI/2, Math.PI/2, dir<0);
+    ctx.lineTo(x+w, y+h);
+  }
+
+  // Bottom edge: right→left
+  if(edges.bottom===0){
+    ctx.lineTo(x, y+h);
+  } else {
+    const cx2=x+w/2, dir=edges.bottom; // dir: 1=tab down, -1=socket up
+    ctx.lineTo(cx2+r, y+h);
+    ctx.arc(cx2, y+h-dir*r, r, 0, Math.PI, dir<0);
+    ctx.lineTo(x, y+h);
+  }
+
+  // Left edge: bottom→top
+  if(edges.left===0){
+    ctx.lineTo(x, y);
+  } else {
+    const cy2=y+h/2, dir=edges.left; // dir: 1=tab left, -1=socket right
+    ctx.lineTo(x, cy2+r);
+    ctx.arc(x+dir*r, cy2, r, Math.PI/2, -Math.PI/2, dir<0);
+    ctx.lineTo(x, y);
+  }
+
+  ctx.closePath();
+}
+
+// SVG-based JigsawTile component for crisp rendering
+function JigsawTile({tile, state, onClick, w=120, h=80}){
+  const svgRef = useRef(null);
+  const r = Math.min(w,h)*0.18;
+
+  // Build jigsaw SVG path string
+  function makePath(e){
+    const x=12, y=12, pw=w-24, ph=h-24; // inner rect with room for tabs
+    let d=`M ${x} ${y} `;
+    // Top
+    if(e.top===0){ d+=`L ${x+pw} ${y} `; }
+    else{ const cx2=x+pw/2,dir=e.top;d+=`L ${cx2-r} ${y} A ${r} ${r} 0 0 ${dir>0?0:1} ${cx2} ${y+dir*r} A ${r} ${r} 0 0 ${dir>0?0:1} ${cx2+r} ${y} L ${x+pw} ${y} `; }
+    // Right
+    if(e.right===0){ d+=`L ${x+pw} ${y+ph} `; }
+    else{ const cy2=y+ph/2,dir=e.right;d+=`L ${x+pw} ${cy2-r} A ${r} ${r} 0 0 ${dir>0?1:0} ${x+pw-dir*r} ${cy2} A ${r} ${r} 0 0 ${dir>0?1:0} ${x+pw} ${cy2+r} L ${x+pw} ${y+ph} `; }
+    // Bottom
+    if(e.bottom===0){ d+=`L ${x} ${y+ph} `; }
+    else{ const cx2=x+pw/2,dir=e.bottom;d+=`L ${cx2+r} ${y+ph} A ${r} ${r} 0 0 ${dir>0?1:0} ${cx2} ${y+ph-dir*r} A ${r} ${r} 0 0 ${dir>0?1:0} ${cx2-r} ${y+ph} L ${x} ${y+ph} `; }
+    // Left
+    if(e.left===0){ d+=`L ${x} ${y} `; }
+    else{ const cy2=y+ph/2,dir=e.left;d+=`L ${x} ${cy2+r} A ${r} ${r} 0 0 ${dir>0?1:0} ${x+dir*r} ${cy2} A ${r} ${r} 0 0 ${dir>0?1:0} ${x} ${cy2-r} L ${x} ${y} `; }
+    d+="Z";
+    return d;
+  }
+
+  const col={
+    idle:   {stroke:C.dimmer,        fill:"#060f1c",  text:C.dim,  mark:"",  glow:"none"},
+    selected:{stroke:tile.color,     fill:`${tile.color}20`,text:tile.color,mark:"",glow:`0 0 14px ${tile.color}66`},
+    correct: {stroke:C.plasma,       fill:`${C.plasma}18`,  text:C.plasma,  mark:"✓",glow:`0 0 18px ${C.plasma}88`},
+    wrong:   {stroke:C.danger,       fill:`${C.danger}18`,  text:C.danger,  mark:"✗",glow:`0 0 12px ${C.danger}55`},
+    missed:  {stroke:`${C.plasma}55`,fill:`${C.plasma}08`,  text:`${C.plasma}77`,mark:"←",glow:"none"},
+  }[state]||{stroke:C.dimmer,fill:"#060f1c",text:C.dim,mark:"",glow:"none"};
+
+  const path=makePath(tile.edges);
+  const lines=tile.label.split("\n");
+
+  return(
+    <div onClick={onClick} style={{
+      cursor:"pointer", userSelect:"none",
+      transform:state==="selected"?"translateY(-4px) scale(1.04)":"none",
+      transition:"transform 0.18s, filter 0.18s",
+      filter:col.glow==="none"?"none":`drop-shadow(${col.glow})`,
+      display:"flex", alignItems:"center", justifyContent:"center",
+    }}>
+      <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} style={{display:"block", overflow:"visible"}}>
+        <defs>
+          <filter id={`glow-${tile.id}`}>
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        {/* Shadow under tile */}
+        <path d={path} fill="rgba(0,0,0,0.4)" transform="translate(2,3)"/>
+        {/* Main tile fill */}
+        <path d={path} fill={col.fill} stroke={col.stroke} strokeWidth={state==="idle"?1.5:2.5}
+          strokeLinejoin="round"/>
+        {/* Inner highlight shimmer */}
+        {state==="selected"&&<path d={path} fill={`${tile.color}10`} stroke="none"/>}
+        {/* Text */}
+        {lines.map((l,i)=>(
+          <text key={i} x={w/2} y={h/2-((lines.length-1)*7)+i*14}
+            textAnchor="middle" dominantBaseline="middle"
+            fontFamily="monospace" fontSize={9} fontWeight="bold" fill={col.text}>
+            {l}
+          </text>
+        ))}
+        {/* Check/cross mark */}
+        {col.mark&&(
+          <text x={w-16} y={18} fontFamily="monospace" fontSize={13} fontWeight="bold"
+            fill={col.text} textAnchor="middle">{col.mark}</text>
+        )}
+        {/* Edge hint dots for interactivity */}
+        {state==="idle"&&[
+          tile.edges.right!==0&&{cx:w-12,cy:h/2},
+          tile.edges.left!==0&&{cx:12,cy:h/2},
+          tile.edges.top!==0&&{cx:w/2,cy:12},
+          tile.edges.bottom!==0&&{cx:w/2,cy:h-12},
+        ].filter(Boolean).map((pt,i)=>(
+          <circle key={i} cx={pt.cx} cy={pt.cy} r={3}
+            fill={C.dimmer} opacity={0.6}/>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// Visual connector showing two tiles snapping together
+function JigsawConnector({colorA, colorB, matched}){
+  return(
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",padding:"0 2px"}}>
+      {matched
+        ?<div style={{width:20,height:4,background:`linear-gradient(90deg,${colorA},${colorB})`,
+            borderRadius:2,boxShadow:`0 0 8px ${colorA}66`}}/>
+        :<div style={{width:20,height:4,background:C.dimmer,borderRadius:2,opacity:0.3}}/>}
+    </div>
+  );
+}
+
+function BeamlineQuiz({onComplete,onBack}){
+  const [idx,setIdx]=useState(0);
+  const [sel,setSel]=useState([]);
+  const [sub,setSub]=useState(false);
+  const [scores,setScores]=useState([]);
+  const [done,setDone]=useState(false);
+  const [hint,setHint]=useState(null);
+  const [finalAvg,setFinalAvg]=useState(0); // stored when done=true, used by Continue button
+
+  const round=SHUFFLED[idx];
+  const needed=round.correct.length;
+
+  const tileState=tile=>{
+    if(!sub)return sel.includes(tile.id)?"selected":"idle";
+    const isSel=sel.includes(tile.id),isOk=tile.isCorrect;
+    if(isSel&&isOk)return"correct";if(isSel&&!isOk)return"wrong";if(!isSel&&isOk)return"missed";return"idle";
+  };
+
+  // Check if any two selected tiles have matching edges (right-left pair)
+  const edgesMatch=(a,b)=> a.edges.right !== 0 && b.edges.left !== 0 && a.edges.right === -b.edges.left;
+  const edgesMatchRL=(a,b)=> a.edges.left !== 0 && b.edges.right !== 0 && a.edges.left === -b.edges.right;
+
+  // For selected tiles, check which pairs connect
+  // Sort selected tiles by chain order for the preview strip:
+  // correct tiles sorted 0→1→2 so tab always faces socket; wrong tiles appended last
+  const selTiles=round.tiles.filter(t=>sel.includes(t.id));
+  const sortedSelTiles=[...selTiles].sort((a,b)=>{
+    const ai=a.isCorrect?a.chainIdx:99;
+    const bi=b.isCorrect?b.chainIdx:99;
+    return ai-bi;
+  });
+  const connectedPairs=[];
+  for(let i=0;i<selTiles.length;i++)
+    for(let j=i+1;j<selTiles.length;j++)
+      if(edgesMatch(selTiles[i],selTiles[j])||edgesMatchRL(selTiles[i],selTiles[j]))
+        connectedPairs.push([selTiles[i].id,selTiles[j].id]);
+  const allThreeConnect= selTiles.length===3 && connectedPairs.length>=2;
+
+  const handleNext=()=>{
+    const hits=sel.filter(id=>round.correct.some(c=>c.id===id)).length;
+    const bad=sel.filter(id=>round.wrong.some(c=>c.id===id)).length;
+    const score=Math.max(0,Math.round(100*(hits/needed)-bad*15));
+    const ns=[...scores,score];setScores(ns);
+    if(idx>=SHUFFLED.length-1){
+      setFinalAvg(Math.round(ns.reduce((a,b)=>a+b,0)/ns.length));
+      setDone(true);
+    }
+    else{setSel([]);setSub(false);setIdx(i=>i+1);setHint(null);}
+  };
+
+  if(done){
+    return(<div>
+      <div style={{padding:"16px 20px",borderRadius:10,border:`1px solid ${C.plasma}`,background:C.plasmaDim,marginBottom:12}}>
+        <div style={{color:C.plasma,fontWeight:"bold",fontSize:15,fontFamily:"monospace",marginBottom:10}}>🧩 Jigsaw Quiz Complete!</div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
+          {QUIZ_ROUNDS.map((r,i)=>(<div key={r.id} style={{padding:"8px 12px",borderRadius:7,border:`1px solid ${r.color}`,background:`${r.color}12`}}>
+            <div style={{color:r.color,fontSize:9,fontFamily:"monospace",marginBottom:2}}>{r.icon} {r.name}</div>
+            <div style={{color:(scores[i]||0)>=70?C.plasma:C.warn,fontFamily:"monospace",fontSize:16,fontWeight:"bold"}}>{scores[i]??"-"}/100</div>
+          </div>))}
+        </div>
+        <div style={{color:C.text,fontFamily:"monospace",fontSize:13,marginBottom:14}}>
+          Average: <span style={{color:C.plasma,fontWeight:"bold",fontSize:16}}>{finalAvg}/100</span>
+        </div>
+        <button onClick={()=>onComplete(finalAvg)}
+          style={{padding:"10px 26px",borderRadius:8,border:"none",cursor:"pointer",
+            background:`linear-gradient(135deg,${C.plasma},${C.accent})`,
+            color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:13,
+            boxShadow:`0 0 20px ${C.plasma}88`,letterSpacing:1}}>
+          CONTINUE TO BEAMLINE →
+        </button>
+      </div>
+    </div>);
+  }
+
+  const perfect=sub&&sel.length===needed&&sel.every(id=>round.correct.some(c=>c.id===id));
+
+  return(<div>
+    {onBack&&<div style={{marginBottom:8}}><BackBtn onClick={onBack}/></div>}
+
+    {/* Progress */}
+    <div style={{display:"flex",gap:5,marginBottom:10,alignItems:"center"}}>
+      {SHUFFLED.map((_,i)=>(<div key={i} style={{width:i===idx?22:8,height:8,borderRadius:4,
+        background:i<idx?C.plasma:i===idx?C.accent:C.dimmer,transition:"all 0.3s"}}/>))}
+      <div style={{color:C.dim,fontSize:9,fontFamily:"monospace",marginLeft:6}}>Round {idx+1}/{SHUFFLED.length}</div>
+    </div>
+
+    {/* Element card */}
+    <div style={{padding:"10px 14px",borderRadius:9,marginBottom:10,border:`2px solid ${round.color}`,background:`${round.color}0d`}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+        <span style={{fontSize:18}}>{round.icon}</span>
+        <span style={{color:round.color,fontWeight:"bold",fontSize:13,fontFamily:"monospace"}}>{round.name}</span>
+      </div>
+      <div style={{color:C.text,fontSize:11,lineHeight:1.6}}>{round.desc}</div>
+      <div style={{color:C.dim,fontSize:10,marginTop:3,fontFamily:"monospace"}}>
+        Select <b style={{color:round.color}}>{needed}</b> tiles that interlock →
+        <span style={{color:sel.length===needed?round.color:C.dim,marginLeft:6}}>{sel.length} selected</span>
+        {!sub&&allThreeConnect&&<span style={{color:C.plasma,marginLeft:8,fontSize:9}}>✦ edges match!</span>}
+      </div>
+    </div>
+
+    {/* Jigsaw edge hint legend */}
+    <div style={{display:"flex",gap:10,marginBottom:10,padding:"6px 10px",borderRadius:6,background:"#030810",border:`1px solid ${C.dimmer}`,flexWrap:"wrap",alignItems:"center"}}>
+      <div style={{color:C.dim,fontSize:9,fontFamily:"monospace"}}>🔑 Correct 3 tiles form a chain:</div>
+      <div style={{display:"flex",alignItems:"center",gap:3}}>
+        {/* TAB tile (A) */}
+        <svg width={32} height={20} viewBox="0 0 32 20">
+          <path d="M2,2 L20,2 L20,8 A4,4,0,0,1,28,8 L28,12 A4,4,0,0,1,20,12 L20,18 L2,18 Z" fill={`${C.accent}18`} stroke={C.accent} strokeWidth={1.5}/>
+          <text x={11} y={13} fontSize={7} fontFamily="monospace" fill={C.accent} textAnchor="middle">A</text>
+        </svg>
+        <span style={{color:C.plasma,fontSize:11,fontWeight:"bold"}}>+</span>
+        {/* SOCKET-TAB tile (B) */}
+        <svg width={36} height={20} viewBox="0 0 36 20">
+          <path d="M2,2 L8,2 A4,4,0,0,0,8,18 L2,18 L2,12 L8,12 A4,4,0,0,1,16,12 L16,8 A4,4,0,0,1,8,8 L8,2 M16,2 L24,2 L24,8 A4,4,0,0,1,32,8 L32,12 A4,4,0,0,1,24,12 L24,18 L16,18 Z" fill={`${C.accent}18`} stroke={C.accent} strokeWidth={1.5}/>
+          <text x={18} y={13} fontSize={7} fontFamily="monospace" fill={C.accent} textAnchor="middle">B</text>
+        </svg>
+        <span style={{color:C.plasma,fontSize:11,fontWeight:"bold"}}>+</span>
+        {/* SOCKET tile (C) */}
+        <svg width={32} height={20} viewBox="0 0 32 20">
+          <path d="M2,2 L8,2 A4,4,0,0,0,8,18 L2,18 L2,12 L8,12 M8,8 L8,2 M8,8 A4,4,0,0,1,2,8 M2,8 L2,12 M16,2 L30,2 L30,18 L16,18 Z" fill={`${C.accent}18`} stroke={C.accent} strokeWidth={1.5}/>
+          <text x={21} y={13} fontSize={7} fontFamily="monospace" fill={C.accent} textAnchor="middle">C</text>
+        </svg>
+        <span style={{color:C.dim,fontSize:9,fontFamily:"monospace",marginLeft:4}}>TAB fits SOCKET</span>
+      </div>
+    </div>
+
+    {/* Tile grid — 2 rows × 3 cols */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+      {round.tiles.map(tile=>{
+        const isConnectedToAny = !sub && connectedPairs.some(([a,b])=>a===tile.id||b===tile.id);
+        return(
+          <div key={tile.id} style={{display:"flex",flexDirection:"column",alignItems:"center",
+            position:"relative"}}>
+            {isConnectedToAny&&<div style={{
+              position:"absolute",top:-4,left:"50%",transform:"translateX(-50%)",
+              fontSize:8,fontFamily:"monospace",color:C.plasma,zIndex:10,
+              background:"#040c18",padding:"1px 4px",borderRadius:3,
+              border:`1px solid ${C.plasma}44`,whiteSpace:"nowrap"
+            }}>edge fits ↓</div>}
+            <JigsawTile
+              tile={tile}
+              state={tileState(tile)}
+              onClick={()=>{if(!sub)setSel(s=>s.includes(tile.id)?s.filter(x=>x!==tile.id):[...s,tile.id]);}}
+              w={118} h={78}
+            />
+          </div>
+        );
+      })}
+    </div>
+
+    {/* Connection preview: show selected tiles linking together */}
+    {sortedSelTiles.length>0&&!sub&&(
+      <div style={{marginBottom:12,padding:"8px 10px",borderRadius:7,background:"#030810",
+        border:`1px solid ${allThreeConnect?C.plasma:C.dimmer}`}}>
+        <div style={{color:C.dim,fontSize:9,fontFamily:"monospace",marginBottom:6}}>
+          {allThreeConnect?"✦ EDGES INTERLOCKING — looks like a match!":"Selected tiles — do their edges connect?"}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:0,flexWrap:"wrap"}}>
+          {sortedSelTiles.map((t,i)=>{
+            const nextMatches=i<sortedSelTiles.length-1&&(edgesMatch(t,sortedSelTiles[i+1])||edgesMatchRL(t,sortedSelTiles[i+1]));
+            return(<React.Fragment key={t.id}>
+              <JigsawTile tile={t} state="selected" onClick={()=>{}} w={88} h={60}/>
+              {i<sortedSelTiles.length-1&&<JigsawConnector colorA={t.color} colorB={sortedSelTiles[i+1].color} matched={nextMatches}/>}
+            </React.Fragment>);
+          })}
+        </div>
+      </div>
+    )}
+
+    {/* Post-submit result */}
+    {sub&&<div style={{padding:"10px 14px",borderRadius:7,marginBottom:10,
+      border:`1px solid ${perfect?C.plasma:C.warn}`,background:"#040c18",
+      fontFamily:"monospace",fontSize:11,color:C.text,lineHeight:1.8}}>
+      {perfect
+        ?"✓ Perfect! All 3 sub-components correctly identified — edges interlock!"
+        :`${sel.filter(id=>round.correct.some(c=>c.id===id)).length}/${needed} correct. `
+         +(sel.some(id=>round.wrong.some(c=>c.id===id))?"Wrong tiles selected (edges won't fit). ":"")
+         +"Missed items shown with ← arrow."}
+    </div>}
+
+    {/* Action buttons */}
+    <div style={{display:"flex",gap:8}}>
+      {!sub
+        ?<button onClick={()=>setSub(true)} disabled={sel.length===0}
+            style={{padding:"9px 22px",borderRadius:7,border:"none",
+              cursor:sel.length===0?"not-allowed":"pointer",
+              background:allThreeConnect?C.plasma:sel.length===needed?round.color:C.dim,
+              color:"#040c18",fontFamily:"monospace",fontSize:12,fontWeight:"bold",
+              opacity:sel.length===0?0.5:1,transition:"all 0.2s",
+              boxShadow:allThreeConnect?`0 0 16px ${C.plasma}66`:"none"}}>
+            {allThreeConnect?"⚡ EDGES MATCH — CHECK!":"CHECK SELECTION"}
+          </button>
+        :<button onClick={handleNext}
+            style={{padding:"9px 22px",borderRadius:7,border:"none",cursor:"pointer",
+              background:`linear-gradient(135deg,${round.color},${C.plasma})`,
+              color:"#040c18",fontFamily:"monospace",fontSize:12,fontWeight:"bold",
+              boxShadow:`0 0 14px ${round.color}44`}}>
+            {idx<SHUFFLED.length-1?"NEXT ROUND →":"FINISH QUIZ ✓"}
+          </button>}
+    </div>
+  </div>);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OSR DIAGNOSTICS — with new interactive "SR cone placement" tab
+// Three views:
+//  ① SR Generation — animated (as before)
+//  ② Place OSR Screen — drag the screen into the SR cone with cursor
+//  ③ Beam Profile Measure — drag-to-measure (as before)
+// ═══════════════════════════════════════════════════════════════
+// ── BEAMLINE OVERVIEW ──
+function BeamlineOverview({phase,onZoomPlasma,onZoomOSR,onBack}){
+  const ref=useRef(null);
+  const anim=useRef(null);
+  const t=useRef(0);
+
+  useEffect(()=>{
+    const cv=ref.current; if(!cv) return;
+    const W=cv.width=cv.offsetWidth||780, H=cv.height=230;
+    const ctx=cv.getContext("2d");
+
+    const yBeam=H*0.68; // proton beam axis
+
+    // SR emission angle: 65° from horizontal = -25° from +x, going upper-right
+    // In canvas coords (y increases downward): angle = -(65°) = -π*65/180
+    const SR_ANG = -Math.PI * 65/180; // upper-right direction
+
+    const EL=[
+      {x:0.03,w:0.055,label:"SPS",      color:C.proton,  key:"sps"},
+      {x:0.10,w:0.05, label:"TD",      color:"#38bdf8", key:"tdx"},  // transfer dipole, replaces COL+QF-p
+      {x:0.18,w:0.22, label:"PLASMA+e⁻",color:C.plasma,  key:"plasma",hi:true},
+      {x:0.43,w:0.04, label:"OTR",      color:"#f472b6", key:"otr"},
+      {x:0.50,w:0.05, label:"QF-e",     color:"#7dd3fc", key:"qfe"},
+      {x:0.58,w:0.05, label:"DIP",      color:C.osr,     key:"dip",  hi2:true},
+      {x:0.66,w:0.07, label:"BEAM DUMP",     color:"#dc2626", key:"dump"},
+    ];
+
+    const dipCx   = (EL[5].x + EL[5].w/2)*W;  // DIP is now index 5
+    const dumpRx  = (EL[6].x + EL[6].w)*W;    // BEAM DUMP right edge
+    const plasmaX = EL[2].x*W;                 // PLASMA is now index 2
+    const plasmaW = EL[2].w*W;
+
+    // SR distance from dipole top to screen centre
+    const SR_DIST = 72;
+    const scW=46, scH=32;
+    const scCx = dipCx + Math.cos(SR_ANG)*SR_DIST;
+    const scCy = yBeam + Math.sin(SR_ANG)*SR_DIST - 18; // shift up a bit
+
+    // e⁻ injection geometry
+    const eInjSrcX = plasmaX - 50;
+    const eInjSrcY = yBeam - 90;
+    const eInjMergeX = plasmaX + plasmaW*0.22;
+    const eInjMergeY = yBeam;
+    const eBmX = plasmaX + 4;
+    const eBmY = yBeam - 32;
+
+    function draw(){
+      t.current+=0.028;
+      const tt=t.current;
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle="#040c18"; ctx.fillRect(0,0,W,H);
+
+      // ── Proton beamline axis ──
+      ctx.strokeStyle=C.dimmer; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.moveTo(0,yBeam); ctx.lineTo(W,yBeam); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // ── e⁻ injection line (dashed, angled from upper-left) ──
+      ctx.strokeStyle=`${C.electron}55`; ctx.lineWidth=1.5; ctx.setLineDash([4,3]);
+      ctx.beginPath();
+      ctx.moveTo(eInjSrcX-35, eInjSrcY-25);
+      ctx.lineTo(eInjSrcX, eInjSrcY);
+      ctx.quadraticCurveTo(eBmX-10, eBmY, eInjMergeX, eInjMergeY);
+      ctx.stroke(); ctx.setLineDash([]);
+
+      // Small bending magnet on injection line
+      ctx.save();
+      ctx.translate(eBmX-2, eBmY+12);
+      ctx.rotate(-Math.PI/5);
+      ctx.fillStyle="#0a1830"; ctx.fillRect(-6,-9,12,18);
+      ctx.strokeStyle=C.electron; ctx.lineWidth=1.5; ctx.strokeRect(-6,-9,12,18);
+      ctx.restore();
+      ctx.font="7px monospace"; ctx.fillStyle=C.electron+"99"; ctx.textAlign="left";
+      ctx.fillText("e⁻BM",eBmX+8,eBmY-2);
+      ctx.fillText("e⁻ gun",eInjSrcX-50,eInjSrcY-28);
+
+      // ── All beam elements ──
+      EL.forEach(el=>{
+        const ex=el.x*W, ew=el.w*W, ey=yBeam-22, eh=44;
+        const g=ctx.createLinearGradient(ex,ey,ex,ey+eh);
+        g.addColorStop(0,el.color+"44"); g.addColorStop(1,el.color+"0a");
+        ctx.fillStyle=g; ctx.fillRect(ex,ey,ew,eh);
+        const active=(el.hi&&phase>=1)||(el.hi2&&phase>=2);
+        if(active){ctx.shadowBlur=10;ctx.shadowColor=el.color;}
+        ctx.strokeStyle=active?el.color:el.color+"55";
+        ctx.lineWidth=active?2:1;
+        ctx.strokeRect(ex,ey,ew,eh);
+        ctx.shadowBlur=0;
+        ctx.font="7px monospace"; ctx.fillStyle=el.color; ctx.textAlign="center";
+        ctx.fillText(el.label,ex+ew/2,yBeam+32);
+      });
+
+      // ── e⁻ injection particles (animated along injection path) ──
+      if(phase>=1){
+        for(let i=0;i<4;i++){
+          const frac=((tt*0.45+i*0.25)%1);
+          let fx,fy;
+          if(frac<0.5){
+            const f2=frac*2;
+            fx=eInjSrcX+(eBmX-10-eInjSrcX)*f2;
+            fy=eInjSrcY+(eBmY-eInjSrcY)*f2;
+          } else {
+            const f2=(frac-0.5)*2;
+            fx=(eBmX-10)+(eInjMergeX-(eBmX-10))*f2;
+            fy=eBmY+(eInjMergeY-eBmY)*f2;
+          }
+          const eg=ctx.createRadialGradient(fx,fy,0,fx,fy,4);
+          eg.addColorStop(0,"rgba(167,139,250,0.85)"); eg.addColorStop(1,"rgba(167,139,250,0)");
+          ctx.fillStyle=eg; ctx.beginPath(); ctx.arc(fx,fy,4,0,Math.PI*2); ctx.fill();
+        }
+      }
+
+      // ── Proton microbunches — strictly STOP at dumpRx ──
+      if(phase>=1){
+        for(let i=0;i<10;i++){
+          let px=((i/10)*W + tt*52)%W;
+          if(px>dumpRx) px=-999; // hide beyond dump
+          if(px<0||px>dumpRx) continue;
+          const pg=ctx.createRadialGradient(px,yBeam,0,px,yBeam,9);
+          pg.addColorStop(0,"rgba(245,158,11,0.9)"); pg.addColorStop(1,"rgba(245,158,11,0)");
+          ctx.fillStyle=pg; ctx.beginPath(); ctx.arc(px,yBeam,9,0,Math.PI*2); ctx.fill();
+          ctx.fillStyle="#fef3c7"; ctx.beginPath(); ctx.arc(px,yBeam,3,0,Math.PI*2); ctx.fill();
+        }
+      }
+
+      // ── e⁻ beam: plasma exit → OTR → QF-e → dipole ──
+      if(phase>=1){
+        const plasmaExit=(EL[2].x+EL[2].w)*W;  // after plasma (index 2)
+        const dipLx=EL[5].x*W;                  // dipole left edge (index 5)
+        for(let i=0;i<6;i++){
+          const ex=plasmaExit+((tt*60+i*38)%(dipLx-plasmaExit));
+          if(ex>=dipLx) continue;
+          const eg=ctx.createRadialGradient(ex,yBeam,0,ex,yBeam,4);
+          eg.addColorStop(0,"rgba(167,139,250,0.88)"); eg.addColorStop(1,"rgba(167,139,250,0)");
+          ctx.fillStyle=eg; ctx.beginPath(); ctx.arc(ex,yBeam,4,0,Math.PI*2); ctx.fill();
+        }
+      }
+
+      // ── Phase 2: e⁻ bends at dipole along SR_ANG, SR fan, OSR screen ──
+      if(phase>=2){
+        // e⁻ particles exiting dipole at SR_ANG direction
+        for(let i=0;i<5;i++){
+          const dist=((tt*52+i*26)%110);
+          if(dist<14) continue;
+          const bex=dipCx+Math.cos(SR_ANG)*dist;
+          const bey=yBeam+Math.sin(SR_ANG)*dist;
+          const eg=ctx.createRadialGradient(bex,bey,0,bex,bey,4);
+          eg.addColorStop(0,"rgba(167,139,250,0.72)"); eg.addColorStop(1,"rgba(167,139,250,0)");
+          ctx.fillStyle=eg; ctx.beginPath(); ctx.arc(bex,bey,4,0,Math.PI*2); ctx.fill();
+        }
+
+        // SR fan at SR_ANG ±15°
+        const nR=16, fanHalf=0.26;
+        for(let r=0;r<nR;r++){
+          const rayAng=SR_ANG+(r/(nR-1)-0.5)*2*fanHalf;
+          const inten=Math.exp(-0.5*Math.pow((r/(nR-1)-0.5)/0.20,2));
+          const rLen=SR_DIST*0.92*inten;
+          ctx.beginPath();
+          ctx.moveTo(dipCx,yBeam-22); // from top face of dipole
+          ctx.lineTo(dipCx+Math.cos(rayAng)*rLen,(yBeam-22)+Math.sin(rayAng)*rLen);
+          ctx.strokeStyle=`rgba(255,159,28,${inten*0.70})`; ctx.lineWidth=1.5; ctx.stroke();
+        }
+
+        // OSR screen — rotated perpendicular to SR_ANG, offset along that ray
+        ctx.save();
+        ctx.translate(scCx,scCy);
+        ctx.rotate(SR_ANG+Math.PI/2);
+        ctx.fillStyle="#0a1830"; ctx.fillRect(-scW/2,-scH/2,scW,scH);
+        ctx.strokeStyle="#f472b6"; ctx.lineWidth=2; ctx.strokeRect(-scW/2,-scH/2,scW,scH);
+        // beam spot glow
+        for(let py=-scH/2;py<scH/2;py++){
+          const v=Math.exp(-py*py/(2*36));
+          ctx.fillStyle=`rgba(255,159,28,${v*0.82})`;
+          ctx.fillRect(-scW/2+2,py,scW-4,1);
+        }
+        ctx.restore();
+
+        ctx.font="8px monospace"; ctx.fillStyle="#f472b6"; ctx.textAlign="center";
+        ctx.fillText("OSR",scCx,scCy-scH/2-22);
+        ctx.fillText("SCREEN",scCx,scCy-scH/2-12);
+      }
+
+      // ── Zoom hint PLASMA — always show when onZoomPlasma available ──
+      if(onZoomPlasma){
+        const px=(EL[2].x+EL[2].w/2)*W;
+        ctx.fillStyle=C.plasma+"cc"; ctx.strokeStyle=C.plasma; ctx.lineWidth=1;
+        if(ctx.roundRect)ctx.roundRect(px-26,yBeam-62,52,13,3);else ctx.rect(px-26,yBeam-62,52,13);
+        ctx.fill(); ctx.stroke();
+        ctx.font="bold 7px monospace"; ctx.fillStyle="#040c18"; ctx.textAlign="center";
+        ctx.fillText("CLICK→ZOOM",px,yBeam-53);
+      }
+
+      // ── Zoom hint OSR — always show when onZoomOSR available ──
+      if(onZoomOSR){
+        const hx=dipCx+28, hy=scCy-14;
+        // Draw a small OSR screen box above the hint so it is not empty
+        ctx.save();
+        ctx.translate(dipCx+Math.cos(SR_ANG)*SR_DIST, scCy);
+        ctx.rotate(SR_ANG+Math.PI/2);
+        ctx.fillStyle="#0a1428"; ctx.fillRect(-20,-14,40,28);
+        ctx.strokeStyle=C.osr+"99"; ctx.lineWidth=1.5; ctx.strokeRect(-20,-14,40,28);
+        ctx.restore();
+        // "OSR DIAGNOSTICS" label above
+        ctx.font="bold 8px monospace"; ctx.fillStyle=C.osr; ctx.textAlign="center";
+        const lx=dipCx+Math.cos(SR_ANG)*SR_DIST;
+        const ly=scCy+Math.sin(SR_ANG+Math.PI/2)*20 - 22;
+        ctx.fillText("OSR DIAGNOSTICS",lx,scCy-24);
+        // Click→zoom pill
+        ctx.fillStyle=C.osr+"cc"; ctx.strokeStyle=C.osr; ctx.lineWidth=1;
+        if(ctx.roundRect)ctx.roundRect(hx-30,hy+2,60,13,3);else ctx.rect(hx-30,hy+2,60,13);
+        ctx.fill(); ctx.stroke();
+        ctx.font="bold 7px monospace"; ctx.fillStyle="#040c18"; ctx.textAlign="center";
+        ctx.fillText("CLICK → ZOOM",hx,hy+11);
+      }
+
+      anim.current=requestAnimationFrame(draw);
+    }
+    anim.current=requestAnimationFrame(draw);
+    return()=>cancelAnimationFrame(anim.current);
+  },[phase,onZoomPlasma,onZoomOSR]);
+
+  const handleClick=e=>{
+    const cv=ref.current; if(!cv) return;
+    const r=cv.getBoundingClientRect();
+    const mx=(e.clientX-r.left)/r.width;
+    const my=(e.clientY-r.top)/r.height;
+    // Plasma zoom — always available once overview shown
+    if(mx>0.16&&mx<0.42&&my>0.4&&onZoomPlasma) onZoomPlasma();
+    // OSR zoom — always available once overview shown (upper-right quadrant near DIP)
+    if(mx>0.54&&mx<0.80&&my<0.58&&onZoomOSR) onZoomOSR();
+  };
+
+  return(
+    <div>
+      {onBack&&<div style={{marginBottom:8}}><BackBtn onClick={onBack}/></div>}
+      <div style={{color:C.dim,fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:3}}>
+        AWAKE BEAMLINE — p⁺ stops at BEAM DUMP | e⁻ injected via upper-left line | SR cone 65° → OSR screen
+      </div>
+      <canvas ref={ref} onClick={handleClick}
+        style={{width:"100%",height:230,display:"block",borderRadius:8,cursor:"crosshair",border:`1px solid ${C.border}`}}/>
+    </div>
+  );
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// WAKEFIELD CANVAS — zoomed into plasma cell
+// ═══════════════════════════════════════════════════════════════
+
+// ── WAKEFIELD ──
+function WakefieldCanvas({injected,onInject,injScore,onBack}){
+  const ref=useRef(null);
+  const anim=useRef(null);
+  const t=useRef(0);
+  const pts=useRef([]);
+
+  useEffect(()=>{
+    if(injected&&pts.current.length===0){
+      for(let i=0;i<24;i++) pts.current.push({
+        x:10+Math.random()*15, y:100+(Math.random()-0.5)*16,
+        vx:2.6+Math.random()*1.4, vy:(Math.random()-0.5)*0.4,
+        en:0, ph:Math.random()*Math.PI*2,
+      });
+    }
+    const cv=ref.current; if(!cv) return;
+    const W=cv.width=cv.offsetWidth||720, H=cv.height=200;
+    const ctx=cv.getContext("2d");
+
+    function draw(){
+      t.current+=0.032;
+      const tt=t.current;
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle="#030810"; ctx.fillRect(0,0,W,H);
+
+      // Plasma glow background
+      const pg=ctx.createLinearGradient(0,0,0,H);
+      pg.addColorStop(0,"transparent"); pg.addColorStop(0.5,"#00ff8806"); pg.addColorStop(1,"transparent");
+      ctx.fillStyle=pg; ctx.fillRect(0,0,W,H);
+
+      // Plasma ions
+      for(let i=0;i<90;i++){
+        const ix=((i*131+tt*12)%W), iy=30+((i*73)%(H-60));
+        ctx.fillStyle=`rgba(0,255,136,${0.04+Math.sin(tt+i*0.4)*0.02})`;
+        ctx.beginPath(); ctx.arc(ix,iy,0.9,0,Math.PI*2); ctx.fill();
+      }
+
+      // Wakefield E-field sinusoidal waves
+      const nBuck=8;
+      for(let b=0;b<nBuck;b++){
+        const bx=((b/nBuck)*W+(W-tt*42%W))%W;
+        ctx.beginPath();
+        for(let x=Math.max(0,bx-W/nBuck);x<Math.min(W,bx+W/nBuck);x++){
+          const lp=((x-bx)/(W/nBuck))*Math.PI;
+          const ey=H/2+Math.sin(lp)*50;
+          if(x===Math.max(0,bx-W/nBuck))ctx.moveTo(x,ey);else ctx.lineTo(x,ey);
+        }
+        ctx.strokeStyle=`rgba(0,255,136,${0.28-b*0.025})`; ctx.lineWidth=2; ctx.stroke();
+
+        // Accelerating bucket shading
+        ctx.fillStyle=`rgba(0,255,136,${Math.max(0,0.07-b*0.008)})`;
+        ctx.beginPath();
+        for(let x=bx;x<Math.min(W,bx+W/(nBuck*2));x++){
+          const lp=((x-bx)/(W/nBuck))*Math.PI;
+          ctx.lineTo(x,H/2+Math.sin(lp)*50);
+        }
+        ctx.lineTo(Math.min(W,bx+W/(nBuck*2)),H/2); ctx.lineTo(bx,H/2); ctx.fill();
+      }
+
+      // Proton microbunches
+      for(let i=0;i<11;i++){
+        const px=((i/11)*W+tt*62)%W;
+        const g=ctx.createRadialGradient(px,H/2,0,px,H/2,14);
+        g.addColorStop(0,"rgba(245,158,11,0.88)"); g.addColorStop(1,"rgba(245,158,11,0)");
+        ctx.fillStyle=g; ctx.beginPath(); ctx.arc(px,H/2,14,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle="#fffbeb"; ctx.beginPath(); ctx.arc(px,H/2,3.5,0,Math.PI*2); ctx.fill();
+      }
+
+      // Injection window
+      if(!injected){
+        const wx=W*0.38+Math.sin(tt*0.85)*W*0.09;
+        const wg=ctx.createLinearGradient(wx-45,0,wx+45,0);
+        wg.addColorStop(0,"transparent"); wg.addColorStop(0.5,"rgba(167,139,250,0.18)"); wg.addColorStop(1,"transparent");
+        ctx.fillStyle=wg; ctx.fillRect(wx-45,H*0.12,90,H*0.76);
+        ctx.font="bold 10px monospace"; ctx.fillStyle="#c4b5fd"; ctx.textAlign="center";
+        ctx.fillText("▼ CLICK TO INJECT e⁻",wx,H*0.1);
+        ctx.fillText("▲",wx,H*0.92);
+      }
+
+      // Electrons
+      pts.current.forEach(p=>{
+        p.x+=p.vx; p.y+=Math.sin(p.x/18+p.ph+tt)*0.9;
+        p.en=clamp(p.en+0.0025,0,1);
+        const er=4+p.en*5;
+        const eg=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,er*2.2);
+        eg.addColorStop(0,`rgba(167,139,250,${0.72+p.en*0.28})`);
+        eg.addColorStop(1,"rgba(167,139,250,0)");
+        ctx.fillStyle=eg; ctx.beginPath(); ctx.arc(p.x,p.y,er*2.2,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle="#ede9fe"; ctx.beginPath(); ctx.arc(p.x,p.y,2,0,Math.PI*2); ctx.fill();
+      });
+
+      // Labels
+      ctx.font="9px monospace"; ctx.fillStyle=C.dim; ctx.textAlign="left";
+      ctx.fillText("Rb PLASMA CELL (10m) — Wakefield Ez(z,t) | Proton microbunches → periodic plasma wave",6,13);
+      ctx.textAlign="right";
+      ctx.fillText(injected?`e⁻ surfing | Injection score: ${injScore}/100`:"Click canvas to inject e⁻ witness bunch",W-6,13);
+
+      anim.current=requestAnimationFrame(draw);
+    }
+    anim.current=requestAnimationFrame(draw);
+    return()=>cancelAnimationFrame(anim.current);
+  },[injected,injScore]);
+
+  return(
+    <div>
+      {onBack&&<div style={{marginBottom:8}}><BackBtn onClick={onBack}/></div>}
+      <canvas ref={ref} onClick={onInject}
+        style={{width:"100%",height:200,display:"block",borderRadius:8,
+          cursor:injected?"default":"crosshair",border:`1px solid ${C.border}`}}/>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// OSR DIAGNOSTICS — corrected geometry + intelligent measurement
+// ═══════════════════════════════════════════════════════════════
+
+function OSRDiagnostics({injScore,onMeasured,onBack}){
+  const radRef=useRef(null);
+  const scrRef=useRef(null);
+  const placeRef=useRef(null);
+  const anim=useRef(null);
+  const t=useRef(0);
+
+  const [view,setView]=useState("place");
+  const [result,setResult]=useState(null);
+  const [screenPos,setScreenPos]=useState(null);  // null=not placed yet
+  const [placementScore,setPlacementScore]=useState(null);
+  const [draggingScreen,setDraggingScreen]=useState(false);
+
+  const dragRef=useRef({active:false,sx:0,sy:0,ex:0,ey:0});
+  const screenPosRef=useRef(null);
+
+  const sigX=Math.round(24+(100-injScore)*0.38),sigY=Math.round(16+(100-injScore)*0.28);
+  const trueEn=((sigX*0.11)*(sigY*0.09)/10).toFixed(2);
+
+  // ── SR Generation animation (Tab 1) ──
+  useEffect(()=>{
+    if(view!=="radiation")return;
+    const cv=radRef.current;if(!cv)return;
+    const W=cv.width=cv.offsetWidth||700,H=cv.height=220;
+    const ctx=cv.getContext("2d");
+    const yB=H*0.65,dipcx=W*0.38,SR_ANG=-Math.PI*65/180,SR_DIST=88;
+    const scCx=dipcx+Math.cos(SR_ANG)*SR_DIST,scCy=(yB-32)+Math.sin(SR_ANG)*SR_DIST;
+    const scW=50,scH=34,otrX=dipcx-100,qfX=dipcx-55,dumpRx=dipcx+88;
+
+    function draw(){
+      t.current+=0.03;const tt=t.current;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle="#030810";ctx.fillRect(0,0,W,H);
+      ctx.strokeStyle=C.dimmer;ctx.lineWidth=1;ctx.setLineDash([4,6]);
+      ctx.beginPath();ctx.moveTo(0,yB);ctx.lineTo(W,yB);ctx.stroke();ctx.setLineDash([]);
+      // Elements
+      ctx.fillStyle="#0a1428";ctx.fillRect(otrX-3,yB-26,6,52);ctx.strokeStyle="#f472b6";ctx.lineWidth=2;ctx.strokeRect(otrX-3,yB-26,6,52);
+      ctx.font="8px monospace";ctx.fillStyle="#f472b6";ctx.textAlign="center";ctx.fillText("OTR",otrX,yB+36);
+      ctx.fillStyle="#071830";ctx.fillRect(qfX-11,yB-18,22,36);ctx.strokeStyle="#7dd3fc";ctx.lineWidth=1.5;ctx.strokeRect(qfX-11,yB-18,22,36);
+      ctx.fillStyle="#7dd3fc";ctx.fillText("QF-e",qfX,yB+30);
+      ctx.fillStyle="#0f1f38";ctx.fillRect(dipcx-16,yB-32,32,64);ctx.strokeStyle=C.osr;ctx.lineWidth=2;ctx.strokeRect(dipcx-16,yB-32,32,64);
+      ctx.font="bold 8px monospace";ctx.fillStyle=C.osr;ctx.fillText("DIP",dipcx,yB-10);
+      ctx.fillStyle="#1a0505";ctx.fillRect(dumpRx-14,yB-20,20,40);ctx.strokeStyle="#dc2626";ctx.lineWidth=2;ctx.strokeRect(dumpRx-14,yB-20,20,40);
+      ctx.fillStyle="#dc2626";ctx.fillText("BEAM DUMP",dumpRx-4,yB+32);
+      // OSR screen
+      ctx.save();ctx.translate(scCx,scCy);ctx.rotate(SR_ANG+Math.PI/2);
+      ctx.fillStyle="#0a1428";ctx.fillRect(-scW/2,-scH/2,scW,scH);
+      ctx.strokeStyle="#f472b6";ctx.lineWidth=2;ctx.strokeRect(-scW/2,-scH/2,scW,scH);
+      for(let py=-scH/2;py<scH/2;py++){const v=Math.exp(-py*py/(2*Math.pow(sigY*0.38,2)));ctx.fillStyle=`rgba(255,159,28,${v*0.82})`;ctx.fillRect(-scW/2+2,py,scW-4,1);}
+      ctx.restore();
+      ctx.font="8px monospace";ctx.fillStyle="#f472b6";ctx.textAlign="center";ctx.fillText("OSR SCREEN",scCx,scCy-scH/2-10);
+      // e⁻ beam
+      for(let i=0;i<6;i++){const ex=((tt*58+i*40)%dipcx);const eg=ctx.createRadialGradient(ex,yB,0,ex,yB,5);eg.addColorStop(0,"rgba(167,139,250,0.9)");eg.addColorStop(1,"rgba(167,139,250,0)");ctx.fillStyle=eg;ctx.beginPath();ctx.arc(ex,yB,5,0,Math.PI*2);ctx.fill();}
+      // Bent e⁻
+      for(let i=0;i<5;i++){const dist=((tt*52+i*30)%(SR_DIST*1.1));if(dist<14)continue;const bex=dipcx+Math.cos(SR_ANG)*dist,bey=(yB-32)+Math.sin(SR_ANG)*dist;const eg=ctx.createRadialGradient(bex,bey,0,bex,bey,4);eg.addColorStop(0,"rgba(167,139,250,0.75)");eg.addColorStop(1,"rgba(167,139,250,0)");ctx.fillStyle=eg;ctx.beginPath();ctx.arc(bex,bey,4,0,Math.PI*2);ctx.fill();}
+      // Proton to dump
+      for(let i=0;i<5;i++){const px=(dipcx+16)+((tt*60+i*46)%(dumpRx-dipcx-16));if(px>=dumpRx)continue;const pg=ctx.createRadialGradient(px,yB,0,px,yB,6);pg.addColorStop(0,"rgba(245,158,11,0.72)");pg.addColorStop(1,"rgba(245,158,11,0)");ctx.fillStyle=pg;ctx.beginPath();ctx.arc(px,yB,6,0,Math.PI*2);ctx.fill();}
+      // SR fan
+      for(let r=0;r<18;r++){const ang=SR_ANG+(r/17-0.5)*0.52,inten=Math.exp(-0.5*Math.pow((r/17-0.5)/0.21,2));ctx.beginPath();ctx.moveTo(dipcx,yB-32);ctx.lineTo(dipcx+Math.cos(ang)*SR_DIST*0.9*inten,(yB-32)+Math.sin(ang)*SR_DIST*0.9*inten);ctx.strokeStyle=`rgba(255,159,28,${inten*0.7})`;ctx.lineWidth=1.5;ctx.stroke();}
+      ctx.font="9px monospace";ctx.fillStyle=C.dim;ctx.textAlign="left";
+      ctx.fillText("SR fan emitted at 65° | Drag the OSR screen into the cone to capture synchrotron radiation",6,H-6);
+      anim.current=requestAnimationFrame(draw);
+    }
+    anim.current=requestAnimationFrame(draw);return()=>cancelAnimationFrame(anim.current);
+  },[view,sigX,sigY]);
+
+  // ── Interactive OSR Screen Placement (Tab 2) ──
+  useEffect(()=>{
+    if(view!=="place")return;
+    cancelAnimationFrame(anim.current);
+    const cv=placeRef.current;if(!cv)return;
+    const W=cv.width=cv.offsetWidth||700,H=cv.height=240;
+    const ctx=cv.getContext("2d");
+    const yB=H*0.68,dipcx=W*0.40;
+    const SR_ANG=-Math.PI*65/180;
+    const SR_DIST=110; // max fan length
+    const FAN_HALF=0.26; // ±15° in rad
+    const scW=50,scH=36;
+
+    // "optimal" screen centre is along SR_ANG at distance ~SR_DIST from dipole top
+    const optDist=SR_DIST*0.88;
+    const dipTopX=dipcx,dipTopY=yB-34;
+    const optCx=dipTopX+Math.cos(SR_ANG)*optDist;
+    const optCy=dipTopY+Math.sin(SR_ANG)*optDist;
+
+    function draw(){
+      t.current+=0.028;const tt=t.current;
+      ctx.clearRect(0,0,W,H);ctx.fillStyle="#030810";ctx.fillRect(0,0,W,H);
+
+      // Beam axis
+      ctx.strokeStyle=C.dimmer;ctx.lineWidth=1;ctx.setLineDash([4,5]);
+      ctx.beginPath();ctx.moveTo(0,yB);ctx.lineTo(W,yB);ctx.stroke();ctx.setLineDash([]);
+
+      // Dipole
+      ctx.fillStyle="#0f1f38";ctx.fillRect(dipcx-18,yB-36,36,72);
+      ctx.strokeStyle=C.osr;ctx.lineWidth=2;ctx.strokeRect(dipcx-18,yB-36,36,72);
+      ctx.font="bold 9px monospace";ctx.fillStyle=C.osr;ctx.textAlign="center";ctx.fillText("DIP",dipcx,yB-8);
+
+      // SR fan — drawn first (behind screen)
+      for(let r=0;r<22;r++){
+        const ang=SR_ANG+(r/21-0.5)*2*FAN_HALF;
+        const inten=Math.exp(-0.5*Math.pow((r/21-0.5)/0.20,2));
+        ctx.beginPath();ctx.moveTo(dipTopX,dipTopY);
+        ctx.lineTo(dipTopX+Math.cos(ang)*SR_DIST*inten,dipTopY+Math.sin(ang)*SR_DIST*inten);
+        ctx.strokeStyle=`rgba(255,159,28,${inten*0.75})`;ctx.lineWidth=1.8;ctx.stroke();
+      }
+
+      // Animated photon dots along SR_ANG
+      for(let i=0;i<8;i++){
+        const dist=((tt*60+i*22)%SR_DIST)*0.9;
+        const ang=SR_ANG+Math.sin(tt*1.2+i*0.7)*FAN_HALF*0.6;
+        const px=dipTopX+Math.cos(ang)*dist,py=dipTopY+Math.sin(ang)*dist;
+        const inten=Math.exp(-0.5*Math.pow((ang-SR_ANG)/(FAN_HALF*0.5),2));
+        ctx.beginPath();ctx.arc(px,py,2.5,0,Math.PI*2);
+        ctx.fillStyle=`rgba(255,159,28,${inten*0.85})`;ctx.fill();
+      }
+
+      // Optimal target ring (ghost / guide)
+      ctx.beginPath();ctx.arc(optCx,optCy,28,0,Math.PI*2);
+      ctx.strokeStyle=`${C.plasma}30`;ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);
+      ctx.font="7px monospace";ctx.fillStyle=`${C.plasma}60`;ctx.textAlign="center";
+      ctx.fillText("optimal",optCx,optCy+38);
+
+      // Draggable OSR screen — use ref position
+      const sp=screenPosRef.current;
+      if(sp){
+        ctx.save();ctx.translate(sp.x,sp.y);ctx.rotate(SR_ANG+Math.PI/2);
+        // Coverage calculation: how much of the SR cone centre hits the screen
+        const dx=sp.x-dipTopX,dy=sp.y-dipTopY;
+        const dist=Math.sqrt(dx*dx+dy*dy);
+        const ang=Math.atan2(dy,dx);
+        const angDiff=Math.abs(ang-SR_ANG);
+        const coverage=Math.exp(-angDiff*angDiff/0.04)*Math.exp(-Math.pow((dist-optDist)/(optDist*0.3),2));
+        const coverageCol=coverage>0.7?C.plasma:coverage>0.4?C.warn:C.danger;
+        ctx.fillStyle=`${coverageCol}20`;ctx.fillRect(-scW/2,-scH/2,scW,scH);
+        ctx.strokeStyle=coverageCol;ctx.lineWidth=2.5;ctx.strokeRect(-scW/2,-scH/2,scW,scH);
+        // Beam spot intensity on screen
+        for(let py=-scH/2;py<scH/2;py++){
+          const v=Math.exp(-py*py/(2*Math.pow(sigY*0.4,2)))*coverage;
+          ctx.fillStyle=`rgba(255,159,28,${v*0.88})`;ctx.fillRect(-scW/2+2,py,scW-4,1);
+        }
+        ctx.restore();
+
+        // Coverage readout
+        const pct=Math.round(coverage*100);
+        const col=coverage>0.7?C.plasma:coverage>0.4?C.warn:C.danger;
+        ctx.font="bold 10px monospace";ctx.fillStyle=col;ctx.textAlign="left";
+        ctx.fillText(`SR capture: ${pct}%`,8,22);
+        if(coverage>0.7){ctx.font="8px monospace";ctx.fillStyle=C.plasma;ctx.fillText("✓ Screen well-positioned!",8,34);}
+      } else {
+        // Instruction
+        ctx.font="bold 10px monospace";ctx.fillStyle=C.osr+"88";ctx.textAlign="center";
+        ctx.fillText("↑ Click & drag to place the OSR screen in the SR cone ↑",W/2,H-16);
+        // Animated cursor hint arrow
+        const arrowX=optCx+Math.sin(tt*2)*15,arrowY=optCy+20+Math.sin(tt*1.5)*8;
+        ctx.font="16px monospace";ctx.fillStyle=C.osr+"99";ctx.fillText("⊕",arrowX,arrowY);
+      }
+
+      // Incoming e⁻
+      for(let i=0;i<5;i++){
+        const ex=((tt*55+i*38)%(dipcx-18));
+        const eg=ctx.createRadialGradient(ex,yB,0,ex,yB,5);eg.addColorStop(0,"rgba(167,139,250,0.85)");eg.addColorStop(1,"rgba(167,139,250,0)");
+        ctx.fillStyle=eg;ctx.beginPath();ctx.arc(ex,yB,5,0,Math.PI*2);ctx.fill();
+      }
+
+      ctx.font="8px monospace";ctx.fillStyle=C.dim;ctx.textAlign="left";
+      ctx.fillText("SR cone at 65° | Drag the OSR screen to intercept as much SR as possible",6,H-6);
+      anim.current=requestAnimationFrame(draw);
+    }
+    anim.current=requestAnimationFrame(draw);return()=>cancelAnimationFrame(anim.current);
+  },[view,sigX,sigY,placementScore]); // note: doesn't depend on screenPos state to avoid re-starting anim
+
+  // Place-tab mouse handlers
+  const getPlacePos=e=>{const r=placeRef.current.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};};
+  const handlePlaceMD=e=>{
+    const pos=getPlacePos(e);
+    setDraggingScreen(true);
+    screenPosRef.current=pos;
+    setScreenPos({...pos});
+  };
+  const handlePlaceMM=e=>{
+    if(!draggingScreen)return;
+    const pos=getPlacePos(e);
+    screenPosRef.current=pos;
+    // Don't call setScreenPos every frame — only update state on mouseup
+  };
+  const handlePlaceMU=e=>{
+    if(!draggingScreen)return;
+    setDraggingScreen(false);
+    const pos=getPlacePos(e);
+    screenPosRef.current=pos;
+    setScreenPos({...pos});
+    // Score based on position
+    const cv=placeRef.current;if(!cv)return;
+    const W=cv.offsetWidth||700,H=240;
+    const yB=H*0.68,dipcx=W*0.40;
+    const SR_ANG=-Math.PI*65/180;
+    const dipTopX=dipcx,dipTopY=yB-34;
+    const optDist=110*0.88;
+    const dx=pos.x-dipTopX,dy=pos.y-dipTopY;
+    const dist=Math.sqrt(dx*dx+dy*dy);
+    const ang=Math.atan2(dy,dx);
+    const angDiff=Math.abs(ang-SR_ANG);
+    const coverage=Math.exp(-angDiff*angDiff/0.04)*Math.exp(-Math.pow((dist-optDist)/(optDist*0.3),2));
+    const pScore=Math.round(coverage*100);
+    setPlacementScore(pScore);
+    onMeasured&&onMeasured(pScore);
+  };
+
+  // ── OSR Screen Measurement (Tab 3) ──
+  useEffect(()=>{
+    if(view!=="screen")return;cancelAnimationFrame(anim.current);
+    const cv=scrRef.current;if(!cv)return;
+    const W=cv.width=cv.offsetWidth||700,H=cv.height=220;const ctx=cv.getContext("2d");const cx=W/2,cy=H/2;
+    ctx.fillStyle="#030810";ctx.fillRect(0,0,W,H);
+    ctx.strokeStyle="#0a1e30";ctx.lineWidth=1;
+    for(let x=0;x<W;x+=20){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+    for(let y=0;y<H;y+=20){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+    const img=ctx.createImageData(W,H);
+    for(let py=0;py<H;py++)for(let px2=0;px2<W;px2++){
+      const dx=px2-cx,dy=py-cy,v=Math.exp(-dx*dx/(2*sigX*sigX)-dy*dy/(2*sigY*sigY));
+      const ii=(py*W+px2)*4;img.data[ii]=Math.min(255,255*v);img.data[ii+1]=Math.min(255,159*v);img.data[ii+2]=Math.min(255,28*v);img.data[ii+3]=Math.min(255,v*240+4);
+    }
+    ctx.putImageData(img,0,0);
+    ctx.strokeStyle=`${C.accent}33`;ctx.lineWidth=1;ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(cx,0);ctx.lineTo(cx,H);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(0,cy);ctx.lineTo(W,cy);ctx.stroke();ctx.setLineDash([]);
+    ctx.font="10px monospace";ctx.fillStyle=C.dim;ctx.textAlign="left";
+    ctx.fillText(`OSR Beam Profile | σx=${sigX}px  σy=${sigY}px — drag to measure`,6,14);
+  },[view,sigX,sigY]);
+
+  const handleMD=e=>{if(view!=="screen")return;const r=scrRef.current.getBoundingClientRect();const sx=e.clientX-r.left,sy=e.clientY-r.top;dragRef.current={active:true,sx,sy,ex:sx,ey:sy};};
+  const handleMU=()=>{
+    if(!dragRef.current.active)return;dragRef.current.active=false;
+    const{sx,sy,ex,ey}=dragRef.current;const dxPx=Math.abs(ex-sx),dyPx=Math.abs(ey-sy);
+    if(dxPx<15||dyPx<15)return;
+    const msx=(dxPx/4).toFixed(1),msy=(dyPx/4).toFixed(1);
+    const mEn=((parseFloat(msx)*0.11)*(parseFloat(msy)*0.09)).toFixed(2);
+    const err=Math.abs(parseFloat(mEn)-parseFloat(trueEn))/parseFloat(trueEn)*100;
+    const score=Math.max(0,Math.round(100-err*1.2));
+    setResult({msx,msy,mEn,trueEn,score});onMeasured&&onMeasured(score);
+  };
+  const handleMM=e=>{if(!dragRef.current.active)return;
+    dragRef.current.ex=e.clientX-(scrRef.current?.getBoundingClientRect().left||0);
+    dragRef.current.ey=e.clientY-(scrRef.current?.getBoundingClientRect().top||0);
+  };
+
+  return(<div>
+    {onBack&&<div style={{marginBottom:8}}><BackBtn onClick={onBack}/></div>}
+    <div style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+      {[["place","① Place & Align OSR Screen ✦"],["screen","② Profile Measurement"]].map(([v,l])=>(
+        <button key={v} onClick={()=>{cancelAnimationFrame(anim.current);t.current=0;setView(v);setResult(null);}}
+          style={{padding:"5px 13px",borderRadius:4,
+            border:`1px solid ${view===v?C.osr:C.dimmer}`,
+            background:view===v?`${C.osr}18`:"transparent",
+            color:view===v?C.osr:C.dim,
+            fontFamily:"monospace",fontSize:10,cursor:"pointer",
+            boxShadow:v==="place"&&view!=="place"?`0 0 8px ${C.osr}44`:"none"}}>{l}</button>
+      ))}
+    </div>
+
+
+    {view==="place"&&(<div>
+      <p style={{color:C.dim,fontSize:11,fontFamily:"monospace",margin:"0 0 6px",lineHeight:1.6}}>
+        <span style={{color:C.osr}}>Click and drag</span> to position the OSR screen in the synchrotron radiation cone.
+        A well-aligned screen captures maximum SR intensity — just like real AWAKE diagnostics!
+      </p>
+      <canvas ref={placeRef}
+        onMouseDown={handlePlaceMD} onMouseMove={handlePlaceMM} onMouseUp={handlePlaceMU}
+        style={{width:"100%",height:240,display:"block",borderRadius:8,
+          cursor:draggingScreen?"grabbing":"crosshair",border:`1px solid ${C.border}`,marginBottom:8}}/>
+      {placementScore!==null&&(
+        <div style={{padding:"10px 14px",borderRadius:7,
+          border:`1px solid ${placementScore>70?C.plasma:placementScore>40?C.warn:C.danger}`,
+          background:"#030810",fontFamily:"monospace",fontSize:11,color:C.text}}>
+          <span style={{color:placementScore>70?C.plasma:placementScore>40?C.warn:C.danger,fontWeight:"bold"}}>
+            SR capture: {placementScore}% — </span>
+          {placementScore>70?"✓ Excellent alignment! SR cone well-centred on screen.":
+           placementScore>40?"⚠ Partial capture. Move screen closer to the 65° axis.":
+           "✗ Screen misaligned — try placing it along the yellow SR fan direction."}
+        </div>
+      )}
+    </div>)}
+
+    {view==="screen"&&<canvas ref={scrRef} onMouseDown={handleMD} onMouseMove={handleMM} onMouseUp={handleMU}
+      style={{width:"100%",height:220,display:"block",borderRadius:8,cursor:"crosshair",border:`1px solid ${C.border}`}}/>}
+
+    {result&&view==="screen"&&<div style={{marginTop:10,padding:"12px 16px",background:"#030810",
+      border:`1px solid ${result.score>75?C.plasma:result.score>50?C.warn:C.danger}`,borderRadius:8}}>
+      <div style={{display:"flex",gap:14,flexWrap:"wrap",marginBottom:6}}>
+        <Stat label="Measured σx" value={`${result.msx}px`} color={C.accent}/>
+        <Stat label="Measured σy" value={`${result.msy}px`} color={C.accent}/>
+        <Stat label="Meas. ε_n" value={`${result.mEn} mm·mrad`} color={C.osr}/>
+        <Stat label="True ε_n" value={`${result.trueEn} mm·mrad`} color={C.plasma}/>
+        <Stat label="Score" value={`${result.score}/100`} color={result.score>75?C.plasma:C.warn}/>
+      </div>
+    </div>}
+  </div>);
+}
+
+// ── PACRI ──
+function PACRIBranch({diagScore,onBack}){
+  const ref=useRef(null);const[energy,setEnergy]=useState(150);const[tumorD,setTumorD]=useState(12);const[fired,setFired]=useState(false);const[score,setScore]=useState(null);
+  useEffect(()=>{
+    const cv=ref.current;if(!cv)return;const W=cv.width=cv.offsetWidth||700,H=cv.height=220;const ctx=cv.getContext("2d");
+    ctx.fillStyle="#040c18";ctx.fillRect(0,0,W,H);const maxD=25,d2x=d=>W*0.06+d/maxD*(W*0.88);
+    const bg=ctx.createLinearGradient(0,0,W,0);bg.addColorStop(0,"#0a1428");bg.addColorStop(0.5,"#0e2040");bg.addColorStop(1,"#0a1428");
+    ctx.fillStyle=bg;ctx.beginPath();ctx.ellipse(W/2,H/2,W*0.44,H*0.4,0,0,Math.PI*2);ctx.fill();ctx.strokeStyle="#1a3050";ctx.lineWidth=1.5;ctx.stroke();
+    const tx=d2x(tumorD);ctx.fillStyle="rgba(255,59,92,0.22)";ctx.strokeStyle=C.danger;ctx.lineWidth=1.5;ctx.beginPath();ctx.ellipse(tx,H/2,13,19,0,0,Math.PI*2);ctx.fill();ctx.stroke();ctx.font="8px monospace";ctx.fillStyle=C.danger;ctx.textAlign="center";ctx.fillText("TUMOUR",tx,H/2+30);
+    const braggD=0.022*Math.pow(energy,1.77)/10,bx=d2x(Math.min(maxD,braggD));
+    if(fired){
+      ctx.beginPath();for(let d=0;d<=maxD;d+=0.04){const x=d2x(d),rD=d/braggD;let dose=rD<0.9?0.18+rD*0.55:rD<1.0?0.73+(rD-0.9)*8:rD<1.05?Math.max(0,1-(rD-1)*22):0;dose*=0.5+0.5*Math.exp(-Math.pow((d-braggD)/3,2));const y=H/2+20-dose*(H*0.35);if(d===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}
+      ctx.strokeStyle=C.medical;ctx.lineWidth=2.5;ctx.stroke();
+      ctx.strokeStyle=C.medical;ctx.lineWidth=1;ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(bx,H*0.12);ctx.lineTo(bx,H*0.8);ctx.stroke();ctx.setLineDash([]);
+      ctx.font="bold 8px monospace";ctx.fillStyle=C.medical;ctx.textAlign="center";ctx.fillText("Bragg Peak",bx,H*0.09);ctx.fillText(`${braggD.toFixed(1)}cm`,bx,H*0.16);
+      if(!score){const align=Math.abs(tumorD-braggD);setScore(Math.max(0,Math.round(100-align*12)));}
+    }
+    [0,5,10,15,20,25].forEach(d=>{ctx.font="8px monospace";ctx.fillStyle=C.dim;ctx.textAlign="center";ctx.fillText(`${d}cm`,d2x(d),H-5);});
+  },[energy,tumorD,fired,diagScore,score]);
+  return(<div>
+    {onBack&&<div style={{marginBottom:8}}><BackBtn onClick={onBack}/></div>}
+    <p style={{color:C.dim,fontSize:11,fontFamily:"monospace",margin:"0 0 8px",lineHeight:1.7}}>Tune beam energy so the <span style={{color:C.medical}}>Bragg peak</span> lands on the tumour depth.</p>
+    <canvas ref={ref} style={{width:"100%",height:220,display:"block",borderRadius:8,border:`1px solid ${C.border}`,marginBottom:10}}/>
+    <div style={{display:"flex",gap:14,flexWrap:"wrap",marginBottom:10,alignItems:"flex-end"}}>
+      <div><div style={{color:C.dim,fontSize:9,fontFamily:"monospace",marginBottom:3}}>BEAM ENERGY: {energy} MeV</div>
+        <input type="range" min={60} max={250} value={energy} onChange={e=>{setEnergy(+e.target.value);setFired(false);setScore(null);}} style={{width:160,accentColor:C.medical}}/></div>
+      <div><div style={{color:C.dim,fontSize:9,fontFamily:"monospace",marginBottom:3}}>TUMOUR DEPTH: {tumorD} cm</div>
+        <input type="range" min={2} max={22} value={tumorD} onChange={e=>{setTumorD(+e.target.value);setFired(false);setScore(null);}} style={{width:160,accentColor:C.danger}}/></div>
+      <button onClick={()=>{setFired(true);setScore(null);}} style={{padding:"8px 18px",borderRadius:6,border:"none",cursor:"pointer",background:C.medical,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:12}}>IRRADIATE</button>
+    </div>
+    {score!==null&&<div style={{padding:"9px 14px",borderRadius:7,fontFamily:"monospace",fontSize:12,border:`1px solid ${score>80?C.plasma:score>50?C.warn:C.danger}`,background:`${score>80?C.plasma:score>50?C.warn:C.danger}0e`,color:score>80?C.plasma:score>50?C.warn:C.danger}}>
+      {score>80?"✓ Tumour precisely targeted!":score>50?"⚠ Partial overlap — adjust energy":"✗ Peak missed — retune energy"}
+      <span style={{color:C.dim,marginLeft:10,fontSize:10}}>Score: {score}/100</span>
+    </div>}
+  </div>);
+}
+
+// ── LEADERBOARD ──
+function Leaderboard({myScore,myName}){
+  const[entries,setEntries]=useState([]);const[loading,setLoading]=useState(true);const[saved,setSaved]=useState(false);
+  useEffect(()=>{(async()=>{try{const res=await window.storage?.list("awlb:",true);const loaded=[];for(const k of(res?.keys||[])){try{const v=await window.storage.get(k,true);if(v)loaded.push(JSON.parse(v.value));}catch{}}setEntries(loaded.sort((a,b)=>b.score-a.score).slice(0,10));}catch{}setLoading(false);})();},[]);
+  const save=async()=>{if(saved)return;const entry={name:myName||"Anonymous",score:myScore,date:new Date().toLocaleDateString()};try{await window.storage?.set(`awlb:${Date.now()}`,JSON.stringify(entry),true);setSaved(true);setEntries(p=>[...p,entry].sort((a,b)=>b.score-a.score).slice(0,10));}catch{}};
+  return(<div style={{marginTop:14}}>
+    <div style={{color:C.dim,fontSize:9,fontFamily:"monospace",letterSpacing:2,marginBottom:6}}>GLOBAL LEADERBOARD</div>
+    {loading?<div style={{color:C.dim,fontSize:11,fontFamily:"monospace"}}>Loading...</div>:(<div>
+      {entries.length===0&&<div style={{color:C.dim,fontSize:11,fontFamily:"monospace"}}>No entries yet — be first!</div>}
+      {entries.map((e,i)=>(<div key={i} style={{display:"flex",gap:10,alignItems:"center",padding:"5px 9px",borderRadius:4,background:e.name===myName?`${C.accent}14`:"transparent",border:`1px solid ${i===0?C.warn+"44":e.name===myName?C.accent:"transparent"}`,marginBottom:2}}>
+        <div style={{color:i===0?C.warn:C.dim,fontFamily:"monospace",fontSize:11,width:18}}>{i+1}</div>
+        <div style={{color:C.text,fontFamily:"monospace",fontSize:12,flex:1}}>{e.name}</div>
+        <div style={{color:C.accent,fontFamily:"monospace",fontSize:13,fontWeight:"bold"}}>{e.score}</div>
+      </div>))}
+    </div>)}
+    {!saved&&myScore>0&&<button onClick={save} style={{marginTop:8,padding:"7px 18px",borderRadius:5,border:`1px solid ${C.accent}`,background:C.accentDim,color:C.accent,fontFamily:"monospace",fontSize:11,cursor:"pointer"}}>+ Save Score ({myScore})</button>}
+    {saved&&<div style={{color:C.plasma,fontFamily:"monospace",fontSize:11,marginTop:6}}>✓ Score saved!</div>}
+  </div>);
+}
+
+// ── MAIN APP ──
+export default function AWAKEGame(){
+  const[act,setAct]=useState("intro");const[mode,setMode]=useState("drag");
+  const[scores,setScores]=useState({build:0,inject:0,diag:0,pacri:0});
+  const[injected,setInjected]=useState(false);const[injScore,setInjScore]=useState(0);
+  const[branch,setBranch]=useState(null);const[playerName,setPlayerName]=useState("");const[nameInput,setNameInput]=useState("");
+  const total=Math.round(scores.build*0.3+scores.inject*0.3+scores.diag*0.3+scores.pacri*0.1);
+  const go=a=>{try{window.scrollTo(0,0);}catch{}setAct(a);};
+  const p={background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:18,marginBottom:14};
+  const al={color:C.dim,fontSize:9,fontFamily:"monospace",letterSpacing:3,margin:"0 0 4px",textTransform:"uppercase"};
+  const h2={color:C.text,fontSize:17,fontWeight:"bold",fontFamily:"monospace",margin:"0 0 10px"};
+  const ACT_LIST=[["build","I:BUILD"],["overview1","OVW"],["wakefield","II:WAKE"],["overview2","OVW"],["osr","III:OSR"],["branch","IV:APP"],["results","DONE"]];
+  const actIdx=a=>ACT_LIST.findIndex(([k])=>k===a);
+
+  return(<ErrorBoundary>
+    <div style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"monospace",padding:"14px 10px"}}>
+      <div style={{maxWidth:840,margin:"0 auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14,flexWrap:"wrap",gap:8}}>
+          <div>
+            <div style={{color:C.dim,fontSize:8,letterSpacing:4,marginBottom:2}}>CERN · AWAKE/PACRI · OUTREACH v7</div>
+            <h1 style={{margin:0,fontSize:20,fontWeight:"bold",letterSpacing:2,background:`linear-gradient(90deg,${C.accent},${C.plasma},${C.osr})`,WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>PLASMA ACCELERATOR MISSION</h1>
+          </div>
+          {act!=="intro"&&<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+            <ScoreBadge label="BUILD" score={scores.build}/><ScoreBadge label="INJECT" score={scores.inject}/><ScoreBadge label="DIAG" score={scores.diag}/><ScoreBadge label="TOTAL" score={total}/>
+          </div>}
+        </div>
+
+        {act!=="intro"&&<div style={{display:"flex",gap:2,marginBottom:12}}>
+          {ACT_LIST.map(([a,lbl],i)=>(<div key={a} style={{flex:1,textAlign:"center",padding:"3px 1px",borderRadius:3,fontSize:7,fontWeight:"bold",
+            background:act===a?C.accent:actIdx(act)>i?`${C.plasma}28`:C.panel,color:act===a?C.bg:actIdx(act)>i?C.plasma:C.dim,
+            border:`1px solid ${act===a?C.accent:C.border}`,transition:"all 0.3s"}}>{lbl}</div>))}
+        </div>}
+
+        {act==="intro"&&<div style={p}>
+          <div style={{textAlign:"center",padding:"8px 0"}}>
+            <div style={{fontSize:48,marginBottom:8}}>⚛️</div>
+            <h2 style={{...h2,fontSize:20,textAlign:"center",marginBottom:8}}>Welcome, Beam Operator</h2>
+            <p style={{color:C.dim,lineHeight:1.9,maxWidth:520,margin:"0 auto 12px",fontSize:12}}>
+              The <span style={{color:C.accent}}>AWAKE experiment</span> at CERN uses 400 GeV proton bunches from the SPS to drive plasma wakefields — accelerating electrons to GeV energies in just 10 metres. Electrons are injected <span style={{color:C.plasma}}>directly into the plasma column</span>. After acceleration: OTR → quads → dipole → OSR screen.
+            </p>
+            <div style={{display:"flex",gap:10,justifyContent:"center",marginBottom:14,flexWrap:"wrap"}}>
+              {[{v:"drag",icon:"🔧",t:"Builder Mode",d:"Drag-and-drop beamline"},{v:"jigsaw",icon:"🧩",t:"Jigsaw Quiz",d:"Identify element components"}].map(m=>(
+                <div key={m.v} onClick={()=>setMode(m.v)} style={{padding:"10px 16px",borderRadius:9,cursor:"pointer",textAlign:"center",minWidth:130,border:`2px solid ${mode===m.v?C.accent:C.border}`,background:mode===m.v?C.accentDim:"#040c18",transition:"all 0.2s"}}>
+                  <div style={{fontSize:20,marginBottom:3}}>{m.icon}</div>
+                  <div style={{color:mode===m.v?C.accent:C.text,fontWeight:"bold",fontSize:11}}>{m.t}</div>
+                  <div style={{color:C.dim,fontSize:9,marginTop:1}}>{m.d}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{marginBottom:12}}>
+              <input value={nameInput} onChange={e=>setNameInput(e.target.value)} placeholder="Your name for leaderboard..."
+                style={{padding:"7px 12px",borderRadius:6,border:`1px solid ${C.border}`,background:"#040c18",color:C.text,fontFamily:"monospace",fontSize:12,width:230,outline:"none"}}/>
+            </div>
+            <button onClick={()=>{setPlayerName(nameInput||"Anonymous");go("build");}}
+              style={{padding:"11px 30px",borderRadius:9,border:"none",cursor:"pointer",background:`linear-gradient(135deg,${C.accent},${C.plasma})`,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:14,letterSpacing:1,boxShadow:`0 0 24px ${C.glow}`}}>
+              BEGIN MISSION
+            </button>
+          </div>
+        </div>}
+
+        {act==="build"&&<div style={p}>
+          <p style={al}>Act I — {mode==="drag"?"Beamline Builder":"Jigsaw Quiz"}</p>
+          <h2 style={h2}>{mode==="drag"?"Assemble the AWAKE Beamline":"Jigsaw Quiz — What Is Each Element Made Of?"}</h2>
+          <ErrorBoundary>
+            {mode==="drag"
+              ?<BeamlineBuilder onComplete={s=>{setScores(q=>({...q,build:s}));go("overview1");}} onBack={()=>go("intro")}/>
+              :<BeamlineQuiz onComplete={s=>{setScores(q=>({...q,build:s}));go("overview1");}} onBack={()=>go("intro")}/>}
+          </ErrorBoundary>
+        </div>}
+
+        {act==="overview1"&&<div style={p}>
+          <p style={al}>Beamline Overview</p>
+          <h2 style={h2}>Full AWAKE Beamline — Click to Zoom</h2>
+          <p style={{color:C.dim,fontSize:11,lineHeight:1.8,margin:"0 0 10px"}}>Proton bunch enters plasma via transfer dipole (TD). <span style={{color:C.plasma}}>Click PLASMA</span> to zoom into wakefields, or <span style={{color:C.osr}}>click DIP/OSR</span> to jump to diagnostics.</p>
+          <BeamlineOverview phase={1} onZoomPlasma={()=>go("wakefield")} onZoomOSR={()=>go("osr")} onBack={()=>go("build")}/>
+          <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+            <button onClick={()=>go("wakefield")} style={{padding:"8px 18px",borderRadius:6,border:"none",cursor:"pointer",background:C.plasma,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>⚡ ZOOM PLASMA</button>
+            <button onClick={()=>go("osr")} style={{padding:"8px 18px",borderRadius:6,border:"none",cursor:"pointer",background:C.osr,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>🔬 ZOOM OSR</button>
+          </div>
+        </div>}
+
+        {act==="wakefield"&&<div style={p}>
+          <p style={al}>Act II — Inside Rb Plasma Cell</p>
+          <h2 style={h2}>Wakefield Surfing — Time the Injection</h2>
+          <p style={{color:C.dim,fontSize:11,lineHeight:1.8,margin:"0 0 8px"}}>Proton microbunches drive plasma oscillations. <span style={{color:C.electron}}>Click</span> to inject the electron witness bunch at the optimal phase.</p>
+          <WakefieldCanvas injected={injected} injScore={injScore}
+            onInject={()=>{if(injected)return;const s=Math.round(48+Math.random()*52);setInjScore(s);setInjected(true);setScores(q=>({...q,inject:s}));}}
+            onBack={()=>go("overview1")}/>
+          {injected&&<div style={{marginTop:8,display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+            <div style={{padding:"6px 12px",borderRadius:6,fontFamily:"monospace",fontSize:11,border:`1px solid ${injScore>70?C.plasma:C.warn}`,background:`${injScore>70?C.plasma:C.warn}0e`,color:injScore>70?C.plasma:C.warn}}>
+              {injScore>70?"✓ Optimal phase captured!":"⚠ Off-phase — emittance growth expected"}
+            </div>
+            <button onClick={()=>go("overview2")} style={{padding:"7px 16px",borderRadius:6,border:"none",cursor:"pointer",background:C.accent,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>RETURN TO BEAMLINE →</button>
+          </div>}
+        </div>}
+
+        {act==="overview2"&&<div style={p}>
+          <p style={al}>Beamline Overview</p>
+          <h2 style={h2}>Plasma ✓ — Now: OTR → QF → Dipole → OSR</h2>
+          <BeamlineOverview phase={2} onZoomPlasma={()=>go("wakefield")} onZoomOSR={()=>go("osr")} onBack={()=>go("wakefield")}/>
+          <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+            <button onClick={()=>go("wakefield")} style={{padding:"7px 16px",borderRadius:6,border:`1px solid ${C.plasma}`,background:"transparent",color:C.plasma,fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>← Revisit Plasma</button>
+            <button onClick={()=>go("osr")} style={{padding:"7px 16px",borderRadius:6,border:"none",cursor:"pointer",background:C.osr,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>🔬 ZOOM OSR →</button>
+          </div>
+        </div>}
+
+        {act==="osr"&&<div style={p}>
+          <p style={al}>Act III — OSR Diagnostic Station</p>
+          <h2 style={h2}>Synchrotron Radiation → Emittance Measurement</h2>
+          <p style={{color:C.dim,fontSize:11,lineHeight:1.8,margin:"0 0 8px"}}>Dipole bends e⁻ at 65° → SR → OSR screen. Switch to screen view and <span style={{color:C.osr}}>drag across the beam spot</span> to measure σ_x, σ_y and ε_n.</p>
+          <ErrorBoundary><OSRDiagnostics injScore={injScore} onMeasured={s=>setScores(q=>({...q,diag:s}))} onBack={()=>go("overview2")}/></ErrorBoundary>
+          <button onClick={()=>go("branch")} style={{marginTop:10,padding:"8px 18px",borderRadius:6,border:"none",cursor:"pointer",background:`linear-gradient(90deg,${C.plasma},${C.medical})`,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>CHOOSE APPLICATION →</button>
+        </div>}
+
+        {act==="branch"&&<div style={p}>
+          <p style={al}>Act IV — Application Branch</p>
+          <h2 style={h2}>Choose Your Mission Objective</h2>
+          {!branch&&<div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:10}}>
+            {[{v:"physics",icon:"⚛️",col:C.plasma,t:"AWAKE Run-3",d:"Beam quality for particle physics"},{v:"medical",icon:"🏥",col:C.medical,t:"PACRI Medical",d:"Tumour Bragg peak treatment"}].map(b=>(
+              <div key={b.v} onClick={()=>setBranch(b.v)} style={{flex:1,minWidth:170,padding:"12px",borderRadius:9,cursor:"pointer",border:`2px solid ${b.col}`,background:`${b.col}0e`,transition:"all 0.2s"}}>
+                <div style={{fontSize:24,marginBottom:4}}>{b.icon}</div>
+                <div style={{color:b.col,fontWeight:"bold",fontSize:12,marginBottom:3}}>{b.t}</div>
+                <div style={{color:C.dim,fontSize:10,lineHeight:1.6}}>{b.d}</div>
+              </div>
+            ))}
+          </div>}
+          {branch==="physics"&&<div>
+            <BackBtn onClick={()=>setBranch(null)}/>
+            <div style={{marginTop:10,padding:"12px 14px",borderRadius:7,border:`1px solid ${C.plasma}`,background:C.plasmaDim}}>
+              <div style={{color:C.plasma,fontWeight:"bold",marginBottom:4}}>AWAKE Run-3 Analysis</div>
+              <p style={{color:C.text,fontSize:11,lineHeight:1.9,margin:0}}>Injection score: <span style={{color:C.accent}}>{injScore}/100</span> → ε_n ≈ {(2.0+(100-injScore)*0.032).toFixed(2)} mm·mrad. Target: &lt;2 mm·mrad. {injScore>75?"✓ Qualifies for Run-3!":"Improve injection timing to reduce emittance."}</p>
+            </div>
+            <button onClick={()=>go("results")} style={{marginTop:8,padding:"7px 18px",borderRadius:6,border:"none",cursor:"pointer",background:C.plasma,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>VIEW RESULTS →</button>
+          </div>}
+          {branch==="medical"&&<div>
+            <ErrorBoundary><PACRIBranch diagScore={scores.diag} onBack={()=>setBranch(null)}/></ErrorBoundary>
+            <button onClick={()=>go("results")} style={{marginTop:8,padding:"7px 18px",borderRadius:6,border:"none",cursor:"pointer",background:C.medical,color:"#040c18",fontWeight:"bold",fontFamily:"monospace",fontSize:11}}>VIEW RESULTS →</button>
+          </div>}
+        </div>}
+
+        {act==="results"&&<div style={p}>
+          <p style={al}>Mission Complete</p>
+          <h2 style={h2}>AWAKE Operator Report</h2>
+          <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:12}}>
+            <ScoreBadge label="BEAMLINE" score={scores.build}/><ScoreBadge label="INJECTION" score={scores.inject}/><ScoreBadge label="DIAGNOSTICS" score={scores.diag}/><ScoreBadge label="TOTAL" score={total}/>
+          </div>
+          <div style={{padding:"10px 14px",borderRadius:8,marginBottom:10,border:`1px solid ${total>75?C.plasma:total>50?C.warn:C.danger}`,background:`${total>75?C.plasma:total>50?C.warn:C.danger}0c`}}>
+            <div style={{color:total>75?C.plasma:total>50?C.warn:C.danger,fontWeight:"bold",marginBottom:4}}>{total>80?"🏆 Expert Physicist":total>60?"⚡ Competent Operator":"📚 Trainee"}</div>
+            <p style={{color:C.text,fontSize:11,lineHeight:1.9,margin:0}}>{total>80?"Outstanding — beamline, injection, and emittance all near-optimal. AWAKE Run-3 approved!":total>60?"Good work. Successful acceleration event recorded. Refine injection for better emittance.":"Beam produced but significant emittance growth. Review element order and injection phase."}</p>
+          </div>
+          <Leaderboard myScore={total} myName={playerName}/>
+          <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+            <button onClick={()=>{go("intro");setInjected(false);setInjScore(0);setScores({build:0,inject:0,diag:0,pacri:0});setBranch(null);}} style={{padding:"7px 18px",borderRadius:6,border:`1px solid ${C.accent}`,background:"transparent",color:C.accent,fontFamily:"monospace",fontSize:11,cursor:"pointer"}}>↩ REPLAY</button>
+            <button onClick={()=>{go("branch");setBranch(null);}} style={{padding:"7px 18px",borderRadius:6,border:`1px solid ${C.dim}`,background:"transparent",color:C.dim,fontFamily:"monospace",fontSize:11,cursor:"pointer"}}>↩ OTHER BRANCH</button>
+          </div>
+        </div>}
+
+        <div style={{textAlign:"center",color:C.dimmer,fontSize:8,letterSpacing:2,marginTop:4}}>AWAKE · PACRI · CERN · OUTREACH · NOT FOR OPERATIONAL USE</div>
+      </div>
+      <style>{`*{box-sizing:border-box;}input[type=range]{height:3px;border-radius:2px;}`}</style>
+    </div>
+  </ErrorBoundary>);
+}
